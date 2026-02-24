@@ -4,30 +4,134 @@
 # 设计语言：深色背景 + 金色/琥珀色 accent + 精致感
 #
 # 用法:
-#   export DEVELOP_API_TOKEN=<管理员令牌>
-#   export DEVELOP_API_SERVER=http://localhost:3000  # 可选，默认 localhost
 #   bash scripts/template-dark.sh
+#
+# 凭据从 scripts/config.json 自动加载（由 setup.sh install 生成）。
 #
 # 注意：Logo 使用 /logo-dark.svg，需要该文件存在于 web/public/ 目录。
 #       生产环境部署前需重新构建前端（bun run build），或将 Logo 改为外部 URL。
 #       模板使用固定配色（深色背景），不跟随系统暗色/亮色主题切换。
 # ============================================================================
 
-SERVER="${DEVELOP_API_SERVER:-http://localhost:3000}"
-TOKEN="${DEVELOP_API_TOKEN:-}"
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
-if [ -z "$TOKEN" ]; then
-  echo "错误：请先设置管理员令牌"
-  echo ""
-  echo "  export DEVELOP_API_TOKEN=<你的管理员令牌>"
-  echo "  bash $0"
-  echo ""
-  echo "令牌获取方式：登录管理后台 → 令牌管理 → 复制令牌"
+# ========== 依赖检查 ==========
+
+# Python 3（支持 python3 或 python 命令名）
+_DA_PYTHON=$(command -v python3 || command -v python || true)
+if [ -z "$_DA_PYTHON" ]; then
+  echo "错误：需要 python3 或 python，请先安装"
+  exit 1
+fi
+if ! "$_DA_PYTHON" -c "import sys; assert sys.version_info >= (3,6)" 2>/dev/null; then
+  echo "错误：需要 Python 3.6+，当前: $("$_DA_PYTHON" --version 2>&1)"
   exit 1
 fi
 
-_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-source "${_SCRIPT_DIR}/_common.sh"
+# curl
+if ! command -v curl &>/dev/null; then
+  echo "错误：需要 curl，请先安装"
+  exit 1
+fi
+
+# ========== 加载凭据（从 config.json） ==========
+
+_DA_CONFIG_FILE="${_SCRIPT_DIR}/config.json"
+if [ ! -f "$_DA_CONFIG_FILE" ]; then
+  echo "错误：未找到凭据文件 $_DA_CONFIG_FILE"
+  echo "请先运行: ./scripts/setup.sh install"
+  exit 1
+fi
+
+SERVER=$("$_DA_PYTHON" -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('server',''))" "$_DA_CONFIG_FILE")
+TOKEN=$("$_DA_PYTHON" -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('token',''))" "$_DA_CONFIG_FILE")
+USER_ID=$("$_DA_PYTHON" -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('user_id',''))" "$_DA_CONFIG_FILE")
+
+if [ -z "$TOKEN" ] || [ -z "$USER_ID" ]; then
+  echo "错误：config.json 中缺少 token 或 user_id"
+  echo "请重新运行: ./scripts/setup.sh install"
+  exit 1
+fi
+
+# ========== 临时文件自动清理 ==========
+
+_DA_TMPFILES=()
+_da_cleanup() { rm -f "${_DA_TMPFILES[@]}"; }
+trap _da_cleanup EXIT INT TERM
+
+# ========== 通用设置函数 ==========
+
+# 从 stdin 读取值，调用 API 设置选项
+# 用法：printf 'value' | set_option "Key"
+#       cat <<'EOF' | set_option "Key"
+#       multi-line value
+#       EOF
+set_option() {
+  local key="$1"
+  local value
+  value=$(cat)
+  local tmpfile
+  tmpfile=$(mktemp)
+  _DA_TMPFILES+=("$tmpfile")
+
+  printf '%s' "$value" | "$_DA_PYTHON" -c "
+import json, sys
+key = sys.argv[1]
+value = sys.stdin.read()
+with open(sys.argv[2], 'w') as f:
+    json.dump({'key': key, 'value': value}, f)
+" "$key" "$tmpfile"
+
+  local response curl_err
+  curl_err=$(mktemp)
+  _DA_TMPFILES+=("$curl_err")
+  response=$(curl -s -X PUT "${SERVER}/api/option/" \
+    -H "Authorization: Bearer ${TOKEN}" \
+    -H "New-Api-User: ${USER_ID}" \
+    -H "Content-Type: application/json" \
+    -d "@${tmpfile}" 2>"$curl_err") || true
+
+  rm -f "$tmpfile"
+
+  if [ -z "$response" ]; then
+    local err_detail
+    err_detail=$(cat "$curl_err")
+    rm -f "$curl_err"
+    echo "  ✗ $key - 网络连接失败: ${err_detail:-服务器无响应}"
+    return 1
+  fi
+
+  rm -f "$curl_err"
+
+  if printf '%s' "$response" | "$_DA_PYTHON" -c "import json,sys; exit(0 if json.load(sys.stdin).get('success') else 1)" 2>/dev/null; then
+    echo "  ✓ $key"
+  else
+    # 提取错误消息
+    local msg
+    msg=$(printf '%s' "$response" | "$_DA_PYTHON" -c "
+import json,sys
+try:
+  d=json.load(sys.stdin); print(d.get('message','未知错误'))
+except:
+  print(sys.stdin.read())
+" 2>/dev/null)
+    echo "  ✗ $key - ${msg:-$response}"
+
+    # 认证失败时提前终止，避免重复相同错误
+    if printf '%s' "$response" | "$_DA_PYTHON" -c "
+import json,sys
+d=json.load(sys.stdin)
+m=d.get('message','')
+sys.exit(0 if any(k in m for k in ['token','无权','未登录','unauthorized']) else 1)
+" 2>/dev/null; then
+      echo ""
+      echo "错误：认证失败，请检查 config.json 中的 token 是否正确。"
+      exit 1
+    fi
+  fi
+}
+
+# ========== 模板逻辑 ==========
 
 echo "🌙 正在应用 [深色高雅风] 模板..."
 echo "   服务器: $SERVER"
@@ -136,7 +240,7 @@ HTMLEOF
 # 5. 页脚 (Footer)
 # --------------------------------------------------
 cat <<'HTMLEOF' | set_option "Footer"
-<style>.custom-footer + div { display: none !important; }</style>
+<style>.custom-footer + div { display: none !important; } body,body[theme-mode],body[theme-mode="dark"]{--semi-color-text-0:#E5E5E5;--semi-color-text-1:#999;--semi-color-text-2:#666;--semi-color-primary:#D4A574;--semi-color-primary-hover:#C9956B;--semi-color-fill-0:#1A1A1A;--semi-color-fill-1:#222;--semi-color-fill-2:#2A2A2A;--semi-color-bg-0:#0A0A0A;--semi-color-bg-1:#111;--semi-color-bg-2:#1A1A1A;--semi-color-primary-light-default:rgba(212,165,116,0.15);--semi-color-bg-overlay:#111;--semi-color-border:#2A2A2A} header.sticky{background-color:rgba(10,10,10,0.85)!important;border-bottom:1px solid #2A2A2A!important}</style>
 <div style="text-align:center;padding:20px 0;font-family:Inter,-apple-system,sans-serif;color:#888;font-size:13px;border-top:1px solid rgba(212,165,116,0.3);background:#0A0A0A;">
   <span>© 2025–2026 <a href="https://develop.cc" target="_blank" style="color:#D4A574;text-decoration:none;">BitFactor LLC</a></span>
 </div>
