@@ -5,9 +5,10 @@
 # 使用说明:
 #   ./scripts/setup.sh              显示交互式菜单
 #   ./scripts/setup.sh install      初始化项目、编译并启动服务
+#   ./scripts/setup.sh uninstall    卸载服务、删除所有 install 产物
 #   ./scripts/setup.sh rebuild      重新编译并重启服务
-#   ./scripts/setup.sh pull         从上游同步更新到 xapi 分支
-#   ./scripts/setup.sh push         推送 xapi 分支到 origin
+#   ./scripts/setup.sh pull         从上游同步更新到 main 分支
+#   ./scripts/setup.sh push         推送 main 分支到 origin
 #   ./scripts/setup.sh status       查看服务状态
 #   ./scripts/setup.sh logs         查看服务日志
 #
@@ -18,7 +19,7 @@ set -e
 
 # ===== 配置变量 =====
 SERVICE_NAME="new-api"
-BRANCH_NAME="xapi"
+BRANCH_NAME="main"
 UPSTREAM_URL="https://github.com/Calcium-Ion/new-api.git"
 UPSTREAM_REMOTE="upstream"
 PORT=3000
@@ -468,6 +469,74 @@ restart_service() {
 
 # ===== 命令实现 =====
 
+# uninstall: 停止服务、删除所有 install 产物、清理 systemd 服务
+# 保留源码文件（.env.example、go.mod、web/src/ 等）和 git 仓库
+cmd_uninstall() {
+    title "卸载 New API 服务"
+
+    # 先确认，再停止服务（避免用户取消后服务已停）
+    echo ""
+    warn "即将删除以下内容:"
+    echo "  - 数据库文件: $PROJECT_DIR/one-api.db, *-journal, *-wal, *-shm"
+    echo "  - 环境配置:   $PROJECT_DIR/.env"
+    echo "  - 二进制文件: $PROJECT_DIR/new-api"
+    echo "  - 前端构建:   $PROJECT_DIR/web/dist/"
+    echo "  - 日志目录:   $PROJECT_DIR/logs/"
+    echo "  - 凭据文件:   $SCRIPT_DIR/config.json"
+    if [ "$OS_TYPE" = "linux" ]; then
+        echo "  - systemd 服务: $SYSTEMD_PATH"
+    fi
+    echo ""
+    local answer
+    read -r -p "确认卸载？此操作不可恢复 (y/N): " answer || true
+    if [ "$answer" != "y" ] && [ "$answer" != "Y" ]; then
+        info "已取消卸载"
+        exit 0
+    fi
+
+    # 确认后停止服务
+    info "停止服务..."
+    stop_service
+
+    # 删除数据库文件
+    rm -f "$PROJECT_DIR/one-api.db" "$PROJECT_DIR"/one-api.db-journal \
+         "$PROJECT_DIR"/one-api.db-wal "$PROJECT_DIR"/one-api.db-shm
+    info "已删除数据库文件"
+
+    # 删除环境配置
+    rm -f "$PROJECT_DIR/.env"
+    info "已删除 .env"
+
+    # 删除二进制文件
+    rm -f "$PROJECT_DIR/new-api"
+    info "已删除二进制文件"
+
+    # 删除前端构建产物
+    rm -rf "$PROJECT_DIR/web/dist"
+    info "已删除 web/dist/"
+
+    # 删除日志目录
+    rm -rf "$PROJECT_DIR/logs"
+    info "已删除 logs/"
+
+    # 删除凭据文件
+    rm -f "$SCRIPT_DIR/config.json"
+    info "已删除 config.json"
+
+    # 清理 systemd 服务（仅 Linux）
+    if [ "$OS_TYPE" = "linux" ] && [ -f "$SYSTEMD_PATH" ]; then
+        sudo systemctl disable "$SERVICE_NAME" 2>/dev/null || true
+        sudo rm -f "$SYSTEMD_PATH"
+        sudo systemctl daemon-reload
+        info "已清理 systemd 服务"
+    fi
+
+    title "卸载完成"
+    info "所有 install 产物已清理"
+    info "源码、git 仓库和 upstream remote 配置已保留"
+    info "可随时重新运行 ./scripts/setup.sh install"
+}
+
 # install: 初始化项目、编译并启动服务
 cmd_install() {
     title "安装 New API 服务"
@@ -797,21 +866,23 @@ show_menu() {
     echo -e "${BLUE}===== New API 维护脚本 =====${NC}"
     echo ""
     echo "  1) install   - 初始化项目、编译并启动"
-    echo "  2) rebuild   - 重新编译并重启"
-    echo "  3) pull      - 从上游同步更新"
-    echo "  4) push      - 推送到远程仓库"
-    echo "  5) status    - 查看服务状态"
-    echo "  6) logs      - 查看服务日志"
+    echo "  2) uninstall - 卸载服务、清理所有产物"
+    echo "  3) rebuild   - 重新编译并重启"
+    echo "  4) pull      - 从上游同步更新"
+    echo "  5) push      - 推送到远程仓库"
+    echo "  6) status    - 查看服务状态"
+    echo "  7) logs      - 查看服务日志"
     echo "  0) 退出"
     echo ""
-    read -r -p "请选择操作 [0-6]: " choice || true
+    read -r -p "请选择操作 [0-7]: " choice || true
     case "$choice" in
         1) cmd_install ;;
-        2) cmd_rebuild ;;
-        3) cmd_pull ;;
-        4) cmd_push ;;
-        5) cmd_status ;;
-        6) cmd_logs ;;
+        2) cmd_uninstall ;;
+        3) cmd_rebuild ;;
+        4) cmd_pull ;;
+        5) cmd_push ;;
+        6) cmd_status ;;
+        7) cmd_logs ;;
         0) info "再见！"; exit 0 ;;
         "") info "已取消"; exit 0 ;;
         *) error "无效选择: $choice"; exit 1 ;;
@@ -823,24 +894,26 @@ show_help() {
     echo "用法: $0 [命令]"
     echo ""
     echo "命令:"
-    echo "  install   初始化项目、编译并启动服务"
-    echo "  rebuild   重新编译并重启服务"
-    echo "  pull      从上游同步更新到 $BRANCH_NAME 分支"
-    echo "  push      推送 $BRANCH_NAME 分支到 origin"
-    echo "  status    查看服务状态"
-    echo "  logs      查看服务日志"
+    echo "  install     初始化项目、编译并启动服务"
+    echo "  uninstall   卸载服务、删除所有 install 产物"
+    echo "  rebuild     重新编译并重启服务"
+    echo "  pull        从上游同步更新到 $BRANCH_NAME 分支"
+    echo "  push        推送 $BRANCH_NAME 分支到 origin"
+    echo "  status      查看服务状态"
+    echo "  logs        查看服务日志"
     echo ""
     echo "不带参数运行时显示交互式菜单。"
 }
 
 # ===== 入口 =====
 case "${1:-}" in
-    install) cmd_install ;;
-    rebuild) cmd_rebuild ;;
-    pull)    cmd_pull ;;
-    push)    cmd_push ;;
-    status)  cmd_status ;;
-    logs)    cmd_logs ;;
+    install)   cmd_install ;;
+    uninstall) cmd_uninstall ;;
+    rebuild)   cmd_rebuild ;;
+    pull)      cmd_pull ;;
+    push)      cmd_push ;;
+    status)    cmd_status ;;
+    logs)      cmd_logs ;;
     -h|--help) show_help ;;
     "")      show_menu ;;
     *)
