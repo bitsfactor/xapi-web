@@ -785,8 +785,8 @@ cmd_install() {
             chmod 600 "$_tmp_env"
             # 使用 awk -v 传递变量，避免 secret 中含有 & \ 等 sed 特殊字符导致替换错误
             awk -v secret="$secret" '/^#* *SESSION_SECRET=/ { print "SESSION_SECRET=" secret; next } { print }' \
-                "$PROJECT_DIR/.env" > "$_tmp_env"
-            mv "$_tmp_env" "$PROJECT_DIR/.env"
+                "$PROJECT_DIR/.env" > "$_tmp_env" || { rm -f "$_tmp_env"; error "SESSION_SECRET 替换失败"; exit 1; }
+            mv "$_tmp_env" "$PROJECT_DIR/.env" || { rm -f "$_tmp_env"; error "SESSION_SECRET 写入失败"; exit 1; }
         else
             echo "SESSION_SECRET=${secret}" >> "$PROJECT_DIR/.env"
         fi
