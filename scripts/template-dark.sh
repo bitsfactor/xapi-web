@@ -240,7 +240,18 @@ HTMLEOF
 # 5. 页脚 (Footer)
 # --------------------------------------------------
 cat <<'HTMLEOF' | set_option "Footer"
-<style>.custom-footer + div { display: none !important; } body,body[theme-mode],body[theme-mode="dark"]{--semi-color-text-0:#E5E5E5;--semi-color-text-1:#999;--semi-color-text-2:#666;--semi-color-primary:#D4A574;--semi-color-primary-hover:#C9956B;--semi-color-fill-0:#1A1A1A;--semi-color-fill-1:#222;--semi-color-fill-2:#2A2A2A;--semi-color-bg-0:#0A0A0A;--semi-color-bg-1:#111;--semi-color-bg-2:#1A1A1A;--semi-color-primary-light-default:rgba(212,165,116,0.15);--semi-color-bg-overlay:#111;--semi-color-border:#2A2A2A} header.sticky{background-color:rgba(10,10,10,0.85)!important;border-bottom:1px solid #2A2A2A!important}</style>
+<style>.custom-footer + div { display: none !important; } body,body[theme-mode],body[theme-mode="dark"]{--semi-color-text-0:#E5E5E5;--semi-color-text-1:#999;--semi-color-text-2:#666;--semi-color-primary:#D4A574;--semi-color-primary-hover:#C9956B;--semi-color-fill-0:#1A1A1A;--semi-color-fill-1:#222;--semi-color-fill-2:#2A2A2A;--semi-color-bg-0:#0A0A0A;--semi-color-bg-1:#111;--semi-color-bg-2:#1A1A1A;--semi-color-primary-light-default:rgba(212,165,116,0.15);--semi-color-bg-overlay:#111;--semi-color-border:#2A2A2A} header.sticky{background-color:rgba(10,10,10,0.85)!important;border-bottom:1px solid #2A2A2A!important}
+/* ===== /pricing 页面深色适配 ===== */
+/* 注：:has() 需要 Chrome 105+ / Firefox 121+ / Safari 15.4+，覆盖所有主流现代浏览器 */
+.bg-white:has(.pricing-layout){background:#0A0A0A!important}
+.pricing-layout .text-gray-900,.pricing-search-header .text-gray-900{color:#E5E5E5!important}
+.pricing-layout .text-gray-800,.pricing-search-header .text-gray-800{color:#D4D4D4!important}
+.pricing-layout .text-gray-700,.pricing-search-header .text-gray-700{color:#BABABA!important}
+.pricing-layout .text-gray-600,.pricing-search-header .text-gray-600{color:#999!important}
+.pricing-layout .text-gray-500,.pricing-search-header .text-gray-500{color:#888!important}
+.pricing-layout .border-gray-200,.pricing-layout .border-gray-300{border-color:#2A2A2A!important}
+.pricing-layout .border-blue-500{border-color:#D4A574!important}
+.pricing-layout .bg-blue-50{background:rgba(212,165,116,0.1)!important}</style>
 <div style="text-align:center;padding:20px 0;font-family:Inter,-apple-system,sans-serif;color:#888;font-size:13px;border-top:1px solid rgba(212,165,116,0.3);background:#0A0A0A;">
   <span>© 2025–2026 <a href="https://develop.cc" target="_blank" style="color:#D4A574;text-decoration:none;">BitFactor LLC</a></span>
 </div>
