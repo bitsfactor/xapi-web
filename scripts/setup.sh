@@ -647,71 +647,97 @@ cmd_install() {
         else
             info "服务已就绪，开始初始化..."
 
-            # 登录默认管理员账号（root/123456）
-            local COOKIE_JAR
-            COOKIE_JAR=$(mktemp)
-            local LOGIN_RESP
-            LOGIN_RESP=$(curl -s -c "$COOKIE_JAR" -X POST "http://localhost:$PORT/api/user/login" \
-                -H "Content-Type: application/json" \
-                -d '{"username":"root","password":"123456"}') || true
+            # 检查 setup 状态
+            local SETUP_RESP SETUP_STATUS
+            SETUP_RESP=$(curl -s "http://localhost:$PORT/api/setup") || true
+            SETUP_STATUS=$("$PY" -c "import json,sys; d=json.loads(sys.argv[1]); print(str(d['data']['status']).lower())" "$SETUP_RESP" 2>/dev/null) || true
 
-            # 解析登录响应，提取 user_id
-            local INIT_USER_ID
-            INIT_USER_ID=$("$PY" -c "import json,sys; d=json.loads(sys.argv[1]); print(d['data']['id'])" "$LOGIN_RESP" 2>/dev/null) || true
-
-            if [ -z "$INIT_USER_ID" ]; then
-                warn "登录默认管理员失败（可能已修改过密码），跳过自动初始化"
-                rm -f "$COOKIE_JAR"
-            else
-                # 生成随机密码（8 位字母数字）
-                local ADMIN_PASS
-                ADMIN_PASS=$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 8)
-
-                # 修改用户名和密码（root → admin）
-                local UPDATE_BODY
-                UPDATE_BODY=$("$PY" -c "import json,sys; print(json.dumps({'id':int(sys.argv[1]),'username':'admin','password':sys.argv[2]}))" "$INIT_USER_ID" "$ADMIN_PASS")
-                curl -s -b "$COOKIE_JAR" -X PUT "http://localhost:$PORT/api/user/" \
-                    -H "Content-Type: application/json" -d "$UPDATE_BODY" >/dev/null 2>&1 || true
-
-                # 生成 Access Token
-                local TOKEN_RESP ACCESS_TOKEN
-                TOKEN_RESP=$(curl -s -b "$COOKIE_JAR" "http://localhost:$PORT/api/user/token") || true
-                ACCESS_TOKEN=$("$PY" -c "import json,sys; d=json.loads(sys.argv[1]); print(d['data'])" "$TOKEN_RESP" 2>/dev/null) || true
-
-                # 清理 cookie
-                rm -f "$COOKIE_JAR"
-
-                if [ -z "$ACCESS_TOKEN" ]; then
-                    warn "获取 Access Token 失败，跳过凭据保存"
-                    warn "用户名已修改为 admin，密码: $ADMIN_PASS"
+            if [ "$SETUP_STATUS" = "true" ]; then
+                # 系统已初始化，检查是否有已保存的凭据
+                if [ -f "$SCRIPT_DIR/config.json" ]; then
+                    info "系统已初始化，凭据文件已存在: $SCRIPT_DIR/config.json"
                 else
-                    # 先打印凭据，确保即使 config.json 写入失败也不丢失
-                    echo ""
-                    info "管理后台: http://localhost:$PORT"
-                    info "用户名: admin"
-                    info "密码: $ADMIN_PASS"
-                    info "Access Token: ${ACCESS_TOKEN:0:12}..."
+                    info "系统已初始化，跳过凭据初始化"
+                    warn "如需管理凭据，请手动访问 http://localhost:$PORT"
+                fi
+            elif [ "$SETUP_STATUS" = "false" ]; then
+                # 全新数据库，通过 /api/setup 创建初始管理员
+                local ADMIN_PASS
+                ADMIN_PASS=$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 12)
 
-                    # 写入 config.json（失败不影响凭据输出）
-                    if "$PY" -c "
+                local SETUP_BODY
+                SETUP_BODY=$("$PY" -c "import json,sys; print(json.dumps({'username':'admin','password':sys.argv[1],'confirmPassword':sys.argv[1]}))" "$ADMIN_PASS")
+                local SETUP_POST_RESP SETUP_SUCCESS
+                SETUP_POST_RESP=$(curl -s -X POST "http://localhost:$PORT/api/setup" \
+                    -H "Content-Type: application/json" -d "$SETUP_BODY") || true
+                SETUP_SUCCESS=$("$PY" -c "import json,sys; d=json.loads(sys.argv[1]); print(str(d.get('success',False)).lower())" "$SETUP_POST_RESP" 2>/dev/null) || true
+
+                if [ "$SETUP_SUCCESS" != "true" ]; then
+                    warn "系统初始化失败: $SETUP_POST_RESP"
+                    warn "请手动访问 http://localhost:$PORT 完成初始设置"
+                else
+                    info "管理员账号创建成功"
+
+                    # 登录获取 session
+                    local COOKIE_JAR
+                    COOKIE_JAR=$(mktemp)
+                    local LOGIN_RESP LOGIN_SUCCESS
+                    LOGIN_RESP=$(curl -s -c "$COOKIE_JAR" -X POST "http://localhost:$PORT/api/user/login" \
+                        -H "Content-Type: application/json" \
+                        -d "$("$PY" -c "import json,sys; print(json.dumps({'username':'admin','password':sys.argv[1]}))" "$ADMIN_PASS")") || true
+                    LOGIN_SUCCESS=$("$PY" -c "import json,sys; d=json.loads(sys.argv[1]); print(str(d.get('success',False)).lower())" "$LOGIN_RESP" 2>/dev/null) || true
+
+                    if [ "$LOGIN_SUCCESS" != "true" ]; then
+                        warn "登录失败，跳过 Token 生成"
+                        echo ""
+                        info "管理后台: http://localhost:$PORT"
+                        info "用户名: admin"
+                        info "密码: $ADMIN_PASS"
+                        warn "请妥善保管密码，此密码仅显示一次"
+                        rm -f "$COOKIE_JAR"
+                    else
+                        # 生成 Access Token
+                        local TOKEN_RESP ACCESS_TOKEN
+                        TOKEN_RESP=$(curl -s -b "$COOKIE_JAR" "http://localhost:$PORT/api/user/token") || true
+                        ACCESS_TOKEN=$("$PY" -c "import json,sys; d=json.loads(sys.argv[1]); print(d['data'])" "$TOKEN_RESP" 2>/dev/null) || true
+
+                        rm -f "$COOKIE_JAR"
+
+                        # 先打印凭据，确保即使 config.json 写入失败也不丢失
+                        echo ""
+                        info "管理后台: http://localhost:$PORT"
+                        info "用户名: admin"
+                        info "密码: $ADMIN_PASS"
+
+                        if [ -n "$ACCESS_TOKEN" ]; then
+                            info "Access Token: ${ACCESS_TOKEN:0:12}..."
+
+                            # 写入 config.json（失败不影响凭据输出）
+                            if "$PY" -c "
 import json, sys
 config = {
     'server': sys.argv[1],
     'token': sys.argv[2],
-    'user_id': int(sys.argv[3]),
     'username': 'admin',
-    'password': sys.argv[4]
+    'password': sys.argv[3]
 }
-with open(sys.argv[5], 'w') as f:
+with open(sys.argv[4], 'w') as f:
     json.dump(config, f, indent=2, ensure_ascii=False)
-" "http://localhost:$PORT" "$ACCESS_TOKEN" "$INIT_USER_ID" "$ADMIN_PASS" "$SCRIPT_DIR/config.json"; then
-                        chmod 600 "$SCRIPT_DIR/config.json"
-                        info "凭据已保存到: $SCRIPT_DIR/config.json"
-                    else
-                        warn "config.json 写入失败，请手动记录上述凭据"
+" "http://localhost:$PORT" "$ACCESS_TOKEN" "$ADMIN_PASS" "$SCRIPT_DIR/config.json"; then
+                                chmod 600 "$SCRIPT_DIR/config.json"
+                                info "凭据已保存到: $SCRIPT_DIR/config.json"
+                            else
+                                warn "config.json 写入失败，请手动记录上述凭据"
+                            fi
+                        else
+                            warn "获取 Access Token 失败，跳过凭据保存"
+                        fi
+                        warn "请妥善保管密码，此密码仅显示一次"
                     fi
-                    warn "请妥善保管密码，此密码仅显示一次"
                 fi
+            else
+                warn "无法获取系统状态，跳过自动初始化"
+                warn "请手动访问 http://localhost:$PORT 完成初始设置"
             fi
         fi
     fi
