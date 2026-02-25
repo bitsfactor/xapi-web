@@ -8,7 +8,7 @@
 #
 # 凭据从 scripts/config.json 自动加载（由 setup.sh install 生成）。
 #
-# 注意：Logo 使用 /logo.svg，需要该文件存在于 web/public/ 目录。
+# 注意：Logo 使用 /logo-apple.svg，需要该文件存在于 web/public/ 目录。
 #       生产环境部署前需重新构建前端（bun run build），或将 Logo 改为外部 URL。
 #       模板使用固定浅色配色，不跟随系统暗色/亮色主题切换。
 # ============================================================================
@@ -145,7 +145,7 @@ echo "Develop API" | set_option "SystemName"
 # --------------------------------------------------
 # 2. Logo
 # --------------------------------------------------
-echo "/logo.svg" | set_option "Logo"
+echo "/logo-apple.svg" | set_option "Logo"
 
 # --------------------------------------------------
 # 3. 服务器地址
