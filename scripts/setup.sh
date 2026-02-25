@@ -181,9 +181,10 @@ install_cmd() {
     if [ "$OS_TYPE" = "darwin" ]; then
         ensure_brew
         case "$cmd" in
-            go)  brew install go ;;
-            bun) brew install oven-sh/bun/bun ;;
-            git) brew install git ;;
+            go)    brew install go ;;
+            bun)   brew install oven-sh/bun/bun ;;
+            git)   brew install git ;;
+            redis) brew install redis ;;
         esac
     else
         case "$cmd" in
@@ -204,6 +205,7 @@ install_cmd() {
                 case "$arch" in
                     x86_64)  arch="amd64" ;;
                     aarch64) arch="arm64" ;;
+                    *) error "不支持的 CPU 架构: $arch，请手动安装 Go"; return 1 ;;
                 esac
                 local url="https://go.dev/dl/go${go_ver}.linux-${arch}.tar.gz"
                 # 用子 shell 隔离 trap，避免 trap - 清除父 shell 中已有的全局 trap
@@ -224,15 +226,27 @@ install_cmd() {
                 export BUN_INSTALL="$HOME/.bun"
                 export PATH="$BUN_INSTALL/bin:$PATH"
                 ;;
+            redis)
+                if command -v apt-get &>/dev/null; then
+                    sudo apt-get update && sudo apt-get install -y redis-server
+                elif command -v yum &>/dev/null; then
+                    sudo yum install -y redis
+                else
+                    error "无法自动安装 redis，请手动安装"
+                    return 1
+                fi
+                ;;
         esac
     fi
 
-    # 验证安装结果
-    if ! command -v "$cmd" &>/dev/null; then
+    # 验证安装结果（redis 安装后二进制名为 redis-cli，而非 redis）
+    local verify_cmd="$cmd"
+    [ "$cmd" = "redis" ] && verify_cmd="redis-cli"
+    if ! command -v "$verify_cmd" &>/dev/null; then
         error "$cmd 安装失败，请手动安装"
         return 1
     fi
-    info "$cmd 安装完成: $(command -v "$cmd")"
+    info "$cmd 安装完成: $(command -v "$verify_cmd")"
 }
 
 # 检查所有必要依赖，缺少时自动安装
@@ -422,6 +436,7 @@ build_backend() {
         exit 1
     }
     mv "$tmp_binary" "$BINARY_PATH" || {
+        rm -f "$tmp_binary"
         error "二进制替换失败: $tmp_binary → $BINARY_PATH"
         exit 1
     }
@@ -457,7 +472,7 @@ generate_systemd_service() {
     cat <<EOF
 [Unit]
 Description=New API Service
-After=network.target
+After=network.target redis.service redis-server.service
 
 [Service]
 User=${user}
@@ -504,7 +519,13 @@ stop_service() {
 
 # 启动服务
 # macOS: nohup 后台运行防 SIGHUP，用 pgrep 确认实际进程存活
+# 启动前确保 Redis 运行（仅在 Redis 已安装时）
 start_service() {
+    if command -v redis-cli &>/dev/null; then
+        if ! redis_running; then
+            start_redis || true
+        fi
+    fi
     if [ "$OS_TYPE" = "linux" ]; then
         sudo systemctl restart "$SERVICE_NAME"
     elif [ "$OS_TYPE" = "darwin" ]; then
@@ -530,6 +551,173 @@ start_service() {
 restart_service() {
     stop_service
     start_service
+}
+
+# ===== Redis 管理函数 =====
+
+# 检测 Redis 是否运行中
+# 返回: 0=运行中, 1=未运行或 redis-cli 未安装
+redis_running() {
+    if ! command -v redis-cli &>/dev/null; then
+        return 1
+    fi
+    if command -v timeout &>/dev/null; then
+        timeout 1 redis-cli ping 2>/dev/null | grep -q "PONG"
+    else
+        redis-cli ping 2>/dev/null | grep -q "PONG"
+    fi
+}
+
+# 启动 Redis 服务（不做验证，由调用方负责验证就绪状态）
+# macOS: brew services start redis
+# Linux: systemctl start redis-server / redis
+start_redis() {
+    if redis_running; then
+        info "Redis 已在运行中"
+        return 0
+    fi
+    info "启动 Redis..."
+    if [ "$OS_TYPE" = "darwin" ]; then
+        brew services start redis 2>/dev/null || true
+    else
+        # 先检查哪个服务单元存在，再启动，避免因服务不存在的非零退出触发 fallback
+        if systemctl list-unit-files redis-server.service &>/dev/null 2>&1 \
+                && systemctl list-unit-files redis-server.service | grep -q 'redis-server'; then
+            sudo systemctl start redis-server 2>/dev/null || true
+        elif systemctl list-unit-files redis.service &>/dev/null 2>&1 \
+                && systemctl list-unit-files redis.service | grep -q 'redis.service'; then
+            sudo systemctl start redis 2>/dev/null || true
+        else
+            warn "未找到 redis-server.service 或 redis.service，请手动启动 Redis"
+        fi
+    fi
+}
+
+# 停止 Redis 服务
+# macOS: brew services stop redis
+# Linux: systemctl stop redis-server / redis
+stop_redis() {
+    if ! redis_running; then
+        return 0
+    fi
+    info "停止 Redis..."
+    if [ "$OS_TYPE" = "darwin" ]; then
+        brew services stop redis 2>/dev/null || true
+    else
+        if systemctl list-unit-files redis-server.service &>/dev/null 2>&1 \
+                && systemctl list-unit-files redis-server.service | grep -q 'redis-server'; then
+            sudo systemctl stop redis-server 2>/dev/null || true
+        elif systemctl list-unit-files redis.service &>/dev/null 2>&1 \
+                && systemctl list-unit-files redis.service | grep -q 'redis.service'; then
+            sudo systemctl stop redis 2>/dev/null || true
+        fi
+    fi
+}
+
+# 打印 Redis 状态信息
+# 若未安装：打印"Redis 未安装"
+# 若未运行：打印"Redis 未运行"
+# 若运行中：打印版本和端口
+redis_status() {
+    title "Redis 状态"
+    if ! command -v redis-cli &>/dev/null; then
+        warn "Redis 未安装"
+        return 0
+    fi
+    if redis_running; then
+        info "Redis 正在运行"
+        local _redis_info redis_ver redis_port
+        _redis_info="$(redis-cli info server 2>/dev/null)"
+        redis_ver="$(printf '%s' "$_redis_info" | grep 'redis_version' | cut -d: -f2 | tr -d '[:space:]')"
+        redis_port="$(printf '%s' "$_redis_info" | grep '^tcp_port' | cut -d: -f2 | tr -d '[:space:]')"
+        [ -n "$redis_ver" ]  && info "Redis 版本: $redis_ver"
+        [ -n "$redis_port" ] && info "Redis 端口: $redis_port"
+    else
+        warn "Redis 未运行"
+    fi
+}
+
+# 一键安装配置 Redis（install 专用）
+# 步骤：检测 → 安装 → 启动 → 等待就绪 → 写入 .env（幂等）
+setup_redis() {
+    # 1. 检测是否已安装
+    if ! command -v redis-cli &>/dev/null; then
+        info "Redis 未安装，开始安装..."
+        install_cmd redis || { warn "Redis 安装失败，跳过 Redis 配置"; return 0; }
+        # 写入标记，供 uninstall 时识别是否由本脚本安装（预装的 Redis 不会被卸载）
+        grep -qE '^REDIS_MANAGED_BY_SETUP=true' "$PROJECT_DIR/.env" 2>/dev/null \
+            || echo "REDIS_MANAGED_BY_SETUP=true" >> "$PROJECT_DIR/.env"
+    else
+        info "Redis 已安装: $(command -v redis-cli)"
+    fi
+
+    # 2. 启动 Redis
+    start_redis || true
+
+    # 3. 等待 Redis 就绪（最多 10 秒）
+    local ready=0 _ri=0
+    if redis_running; then
+        ready=1
+    else
+        info "等待 Redis 就绪..."
+        while [ $_ri -lt 10 ]; do
+            if redis_running; then
+                ready=1
+                break
+            fi
+            sleep 1
+            _ri=$((_ri + 1))
+        done
+    fi
+    if [ "$ready" -eq 1 ]; then
+        info "Redis 已就绪"
+    else
+        warn "Redis 未能在 10 秒内就绪，请手动启动 Redis"
+    fi
+
+    # 4a. 写入 REDIS_CONN_STRING（幂等）
+    if grep -qE '^REDIS_CONN_STRING=.+' "$PROJECT_DIR/.env" 2>/dev/null; then
+        info "REDIS_CONN_STRING 已配置，跳过"
+    else
+        if grep -qE '^#*[[:space:]]*REDIS_CONN_STRING=' "$PROJECT_DIR/.env" 2>/dev/null; then
+            local _tmp_r
+            _tmp_r="$(mktemp)"
+            chmod 600 "$_tmp_r"
+            if awk '/^#*[[:space:]]*REDIS_CONN_STRING=/ { print "REDIS_CONN_STRING=redis://localhost:6379/0"; next } { print }' \
+                    "$PROJECT_DIR/.env" > "$_tmp_r" \
+                    && mv "$_tmp_r" "$PROJECT_DIR/.env"; then
+                info "已写入 REDIS_CONN_STRING=redis://localhost:6379/0"
+            else
+                rm -f "$_tmp_r"
+                warn "REDIS_CONN_STRING 写入失败"
+            fi
+        else
+            echo "REDIS_CONN_STRING=redis://localhost:6379/0" >> "$PROJECT_DIR/.env"
+            info "已写入 REDIS_CONN_STRING=redis://localhost:6379/0"
+        fi
+    fi
+
+    # 4b. 写入 MEMORY_CACHE_ENABLED（幂等）
+    if grep -qE '^MEMORY_CACHE_ENABLED=.+' "$PROJECT_DIR/.env" 2>/dev/null; then
+        info "MEMORY_CACHE_ENABLED 已配置，跳过"
+    else
+        if grep -qE '^#*[[:space:]]*MEMORY_CACHE_ENABLED=' "$PROJECT_DIR/.env" 2>/dev/null; then
+            local _tmp_m
+            _tmp_m="$(mktemp)"
+            chmod 600 "$_tmp_m"
+            if awk '/^#*[[:space:]]*MEMORY_CACHE_ENABLED=/ { print "MEMORY_CACHE_ENABLED=true"; next } { print }' \
+                    "$PROJECT_DIR/.env" > "$_tmp_m" \
+                    && mv "$_tmp_m" "$PROJECT_DIR/.env"; then
+                info "已写入 MEMORY_CACHE_ENABLED=true"
+            else
+                rm -f "$_tmp_m"
+                warn "MEMORY_CACHE_ENABLED 写入失败"
+            fi
+        else
+            echo "MEMORY_CACHE_ENABLED=true" >> "$PROJECT_DIR/.env"
+            info "已写入 MEMORY_CACHE_ENABLED=true"
+        fi
+    fi
 }
 
 # 打印凭据信息
@@ -658,19 +846,26 @@ with open(sys.argv[1], 'w') as f:
 # ===== 命令实现 =====
 
 # uninstall: 停止服务、删除所有 install 产物、清理 systemd 服务
-# 保留源码文件（.env.example、go.mod、web/src/ 等）和 git 仓库
+# 保留源码文件（.env.example、go.mod、web/src/ 等）、git 仓库、数据库文件和凭据文件
 cmd_uninstall() {
     title "卸载 New API 服务"
+
+    # 提前读取 Redis 安装标记（.env 会在后续步骤被删除，须在此处读取）
+    local redis_managed=false
+    if grep -qE '^REDIS_MANAGED_BY_SETUP=true' "$PROJECT_DIR/.env" 2>/dev/null; then
+        redis_managed=true
+    fi
 
     # 先确认，再停止服务（避免用户取消后服务已停）
     echo ""
     warn "即将删除以下内容:"
-    echo "  - 数据库文件: $PROJECT_DIR/one-api.db, *-journal, *-wal, *-shm"
     echo "  - 环境配置:   $PROJECT_DIR/.env"
-    echo "  - 二进制文件: $PROJECT_DIR/new-api"
+    echo "  - 二进制文件: $BINARY_PATH"
     echo "  - 前端构建:   $PROJECT_DIR/web/dist/"
     echo "  - 日志目录:   $PROJECT_DIR/logs/"
-    echo "  - 凭据文件:   $SCRIPT_DIR/config.json"
+    if [ "$redis_managed" = "true" ]; then
+        echo "  - Redis 服务及安装包（由本脚本安装）"
+    fi
     if [ "$OS_TYPE" = "linux" ]; then
         echo "  - systemd 服务: $SYSTEMD_PATH"
     fi
@@ -686,19 +881,12 @@ cmd_uninstall() {
     info "停止服务..."
     stop_service
 
-    # 删除数据库文件（统一引号风格）
-    rm -f "$PROJECT_DIR/one-api.db" \
-         "$PROJECT_DIR/one-api.db-journal" \
-         "$PROJECT_DIR/one-api.db-wal" \
-         "$PROJECT_DIR/one-api.db-shm"
-    info "已删除数据库文件"
-
     # 删除环境配置
     rm -f "$PROJECT_DIR/.env"
     info "已删除 .env"
 
     # 删除二进制文件
-    rm -f "$PROJECT_DIR/new-api"
+    rm -f "$BINARY_PATH"
     info "已删除二进制文件"
 
     # 删除前端构建产物
@@ -709,10 +897,6 @@ cmd_uninstall() {
     rm -rf "$PROJECT_DIR/logs"
     info "已删除 logs/"
 
-    # 删除凭据文件
-    rm -f "$SCRIPT_DIR/config.json"
-    info "已删除 config.json"
-
     # 清理 systemd 服务（仅 Linux）
     if [ "$OS_TYPE" = "linux" ] && [ -f "$SYSTEMD_PATH" ]; then
         sudo systemctl disable "$SERVICE_NAME" 2>/dev/null || true
@@ -721,9 +905,31 @@ cmd_uninstall() {
         info "已清理 systemd 服务"
     fi
 
+    # 卸载 Redis（仅限由本脚本安装的，预装的 Redis 不受影响）
+    if [ "$redis_managed" = "true" ] && command -v redis-cli &>/dev/null; then
+        info "停止并卸载 Redis..."
+        stop_redis || true
+        if [ "$OS_TYPE" = "darwin" ]; then
+            brew uninstall redis 2>/dev/null || true
+        else
+            if command -v apt-get &>/dev/null; then
+                sudo apt-get remove -y redis-server 2>/dev/null || true
+            elif command -v yum &>/dev/null; then
+                sudo yum remove -y redis 2>/dev/null || true
+            fi
+        fi
+        info "Redis 已卸载"
+    fi
+
     title "卸载完成"
     info "所有 install 产物已清理"
     info "源码、git 仓库和 upstream remote 配置已保留"
+    if [ -f "$PROJECT_DIR/one-api.db" ]; then
+        info "数据库文件已保留: $PROJECT_DIR/one-api.db"
+    fi
+    if [ -f "$SCRIPT_DIR/config.json" ]; then
+        info "凭据文件已保留: $SCRIPT_DIR/config.json"
+    fi
     info "可随时重新运行 ./scripts/setup.sh install"
 }
 
@@ -795,6 +1001,10 @@ cmd_install() {
         info "SESSION_SECRET 已配置"
     fi
 
+    # 配置 Redis
+    title "配置 Redis"
+    setup_redis
+
     # 构建
     build_frontend
     build_backend
@@ -862,8 +1072,10 @@ cmd_install() {
                     if [ -f "$SCRIPT_DIR/config.json" ]; then
                         info "系统已初始化，凭据文件已存在: $SCRIPT_DIR/config.json"
                     else
-                        info "系统已初始化，跳过凭据初始化"
-                        warn "如需管理凭据，请手动访问 http://localhost:$PORT"
+                        info "系统已初始化（已有数据库），跳过凭据初始化"
+                        warn "未找到凭据文件 $SCRIPT_DIR/config.json"
+                        warn "请使用原有管理员密码登录: http://localhost:$PORT"
+                        warn "如忘记密码，请参考文档通过数据库重置"
                     fi
                 elif [ "$SETUP_STATUS" = "false" ]; then
                     # 全新数据库，调用辅助函数创建初始管理员并保存凭据
@@ -885,8 +1097,12 @@ cmd_install() {
     info "端口: $PORT"
     info "配置文件: $PROJECT_DIR/.env"
     echo ""
-    info "默认使用 SQLite 数据库，无需额外配置"
-    info "如需 MySQL/PostgreSQL/Redis 等，请编辑 $PROJECT_DIR/.env"
+    if grep -qE '^REDIS_CONN_STRING=.+' "$PROJECT_DIR/.env" 2>/dev/null; then
+        info "已自动配置本地 Redis，REDIS_CONN_STRING 已写入 .env"
+    else
+        warn "Redis 配置未成功，如需启用请手动在 $PROJECT_DIR/.env 中设置 REDIS_CONN_STRING"
+    fi
+    info "如需 MySQL/PostgreSQL 等，请编辑 $PROJECT_DIR/.env"
 }
 
 # rebuild: 重新编译并重启服务
@@ -998,11 +1214,12 @@ cmd_status() {
             fi
         else
             warn "服务未运行"
-            info "启动命令: cd $PROJECT_DIR && ./new-api --port $PORT --log-dir ./logs"
+            info "启动命令: cd $PROJECT_DIR && ./$SERVICE_NAME --port $PORT --log-dir ./logs"
         fi
     else
         error "不支持的系统: $OS_TYPE"
     fi
+    redis_status
 }
 
 # logs: 查看服务日志
