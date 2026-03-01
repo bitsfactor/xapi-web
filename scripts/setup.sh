@@ -1624,6 +1624,448 @@ HTMLEOF
     echo "      或将 Logo 选项改为外部图片 URL。"
 }
 
+# ===== Backup 子命令（数据库备份到 Cloudflare R2）=====
+
+# 幂等写入单个 .env 变量（已存在则替换，否则追加）
+_backup_env_write() {
+    local var="$1" val="$2"
+    local env_file="$PROJECT_DIR/.env"
+    touch "$env_file" 2>/dev/null || true
+    if grep -qE "^${var}=" "$env_file" 2>/dev/null; then
+        local _tmp
+        _tmp="$(mktemp)" && chmod 600 "$_tmp" \
+            && awk -v k="$var" -v v="$val" \
+                'BEGIN{pat="^" k "="} $0 ~ pat { print k "=" v; next } { print }' \
+                "$env_file" > "$_tmp" \
+            && mv "$_tmp" "$env_file" || { rm -f "$_tmp"; return 1; }
+    else
+        printf '%s=%s\n' "$var" "$val" >> "$env_file" || return 1
+    fi
+}
+
+# 从 .env 读取单个变量值，不存在时返回第二个参数指定的默认值
+_backup_get_env() {
+    local var="$1" default="${2:-}"
+    local env_file="$PROJECT_DIR/.env"
+    local val
+    val="$(grep -E "^${var}=" "$env_file" 2>/dev/null | tail -1 | cut -d= -f2-)" || true
+    if [ -n "$val" ]; then
+        printf '%s' "$val"
+    else
+        printf '%s' "$default"
+    fi
+}
+
+# 检查 R2 配置是否完整，缺失时打印提示并返回非零
+backup_check_config() {
+    local env_file="$PROJECT_DIR/.env"
+    local var missing=""
+    for var in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET; do
+        if ! grep -qE "^${var}=.+" "$env_file" 2>/dev/null; then
+            missing="${missing} ${var}"
+        fi
+    done
+    if [ -n "$missing" ]; then
+        error "R2 配置不完整，缺少:${missing}"
+        info "请先运行: $0 backup setup"
+        return 1
+    fi
+}
+
+# 交互式配置 R2 凭据，写入 .env（幂等）
+backup_setup() {
+    title "配置 Cloudflare R2 备份"
+    echo ""
+    echo "所需凭据可在 Cloudflare 控制台 → R2 → 管理 API 令牌 中获取。"
+    echo ""
+
+    local account_id access_key secret_key bucket backup_dir keep
+    local cur_id cur_key cur_bucket cur_dir cur_keep
+
+    cur_id="$(_backup_get_env R2_ACCOUNT_ID)"
+    cur_key="$(_backup_get_env R2_ACCESS_KEY_ID)"
+    cur_bucket="$(_backup_get_env R2_BUCKET)"
+    cur_dir="$(_backup_get_env R2_BACKUP_DIR "new-api-backups")"
+    cur_keep="$(_backup_get_env R2_BACKUP_KEEP "7")"
+
+    local prompt_id="Cloudflare Account ID"
+    [ -n "$cur_id" ] && prompt_id="${prompt_id} [${cur_id}]"
+    read -r -p "${prompt_id}: " account_id || true
+    account_id="${account_id:-$cur_id}"
+
+    local prompt_key="R2 Access Key ID"
+    [ -n "$cur_key" ] && prompt_key="${prompt_key} [${cur_key}]"
+    read -r -p "${prompt_key}: " access_key || true
+    access_key="${access_key:-$cur_key}"
+
+    read -r -s -p "R2 Secret Access Key（输入不显示，留空保留现有）: " secret_key || true
+    echo ""
+    if [ -z "$secret_key" ]; then
+        secret_key="$(_backup_get_env R2_SECRET_ACCESS_KEY)"
+    fi
+
+    local prompt_bucket="R2 Bucket 名称"
+    [ -n "$cur_bucket" ] && prompt_bucket="${prompt_bucket} [${cur_bucket}]"
+    read -r -p "${prompt_bucket}: " bucket || true
+    bucket="${bucket:-$cur_bucket}"
+
+    read -r -p "备份目录（桶内路径，默认 ${cur_dir}）: " backup_dir || true
+    backup_dir="${backup_dir:-$cur_dir}"
+
+    read -r -p "保留备份数量（默认 ${cur_keep}）: " keep || true
+    keep="${keep:-$cur_keep}"
+    # 校验保留数量为正整数（W1）
+    if ! printf '%s' "$keep" | grep -qE '^[1-9][0-9]*$'; then
+        warn "保留数量必须为正整数，已重置为 7"
+        keep=7
+    fi
+
+    if [ -z "$account_id" ] || [ -z "$access_key" ] || [ -z "$secret_key" ] || [ -z "$bucket" ]; then
+        error "Account ID、Access Key ID、Secret Key、Bucket 均为必填项"
+        return 1
+    fi
+
+    _backup_env_write "R2_ACCOUNT_ID"        "$account_id" || warn "写入 R2_ACCOUNT_ID 失败"
+    _backup_env_write "R2_ACCESS_KEY_ID"     "$access_key" || warn "写入 R2_ACCESS_KEY_ID 失败"
+    _backup_env_write "R2_SECRET_ACCESS_KEY" "$secret_key" || warn "写入 R2_SECRET_ACCESS_KEY 失败"
+    _backup_env_write "R2_BUCKET"            "$bucket"     || warn "写入 R2_BUCKET 失败"
+    _backup_env_write "R2_BACKUP_DIR"        "$backup_dir" || warn "写入 R2_BACKUP_DIR 失败"
+    _backup_env_write "R2_BACKUP_KEEP"       "$keep"       || warn "写入 R2_BACKUP_KEEP 失败"
+
+    echo ""
+    info "R2 配置已写入 .env"
+    echo "  Account ID : $account_id"
+    echo "  Access Key : $access_key"
+    echo "  Bucket     : ${bucket}/${backup_dir}"
+    echo "  保留数量   : ${keep} 个"
+}
+
+# 执行数据库 dump，结果文件路径写入全局变量 _BACKUP_DUMP_FILE
+# 临时目录路径写入 _BACKUP_DUMP_TMP_DIR（调用方负责清理）
+backup_dump() {
+    local timestamp
+    timestamp="$(date +%Y%m%d_%H%M%S)"
+    local tmp_dir
+    tmp_dir="$(mktemp -d)"
+
+    local sql_dsn
+    sql_dsn="$(_backup_get_env SQL_DSN)"
+    local db_type
+    if printf '%s' "$sql_dsn" | grep -qi "mysql"; then
+        db_type="mysql"
+    elif printf '%s' "$sql_dsn" | grep -qi "postgres"; then
+        db_type="postgres"
+    else
+        db_type="sqlite"
+    fi
+
+    local dump_file
+    case "$db_type" in
+        sqlite)
+            local sqlite_path
+            sqlite_path="$(_backup_get_env SQLITE_PATH "$PROJECT_DIR/new-api.db")"
+            dump_file="${tmp_dir}/new-api_${timestamp}.db"
+            if [ ! -f "$sqlite_path" ]; then
+                error "SQLite 数据库文件不存在: $sqlite_path"
+                rm -rf "$tmp_dir"
+                return 1
+            fi
+            info "备份 SQLite: $sqlite_path"
+            # 优先使用 sqlite3 .backup（在线热备份，保证一致性）；B2
+            if command -v sqlite3 >/dev/null 2>&1; then
+                sqlite3 "$sqlite_path" ".backup '${dump_file}'" \
+                    || { rm -rf "$tmp_dir"; return 1; }
+            else
+                warn "未找到 sqlite3，使用 cp 复制（运行中写入可能导致备份不一致）"
+                cp "$sqlite_path" "$dump_file" || { rm -rf "$tmp_dir"; return 1; }
+            fi
+            ;;
+        mysql)
+            if ! command -v mysqldump >/dev/null 2>&1; then
+                error "未找到 mysqldump，请先安装 MySQL 客户端工具"
+                rm -rf "$tmp_dir"
+                return 1
+            fi
+            dump_file="${tmp_dir}/new-api_${timestamp}.sql.gz"
+            info "备份 MySQL..."
+            # GORM DSN 格式: user:pass@tcp(host:port)/dbname?opts
+            # 注意：密码中含 @ 字符时解析会出错（W2），请确保密码不含 @
+            local db_user db_pass db_host db_port db_name
+            db_user="$(printf '%s' "$sql_dsn" | sed 's/:.*//')"
+            db_pass="$(printf '%s' "$sql_dsn" | sed 's/[^:]*://;s/@tcp(.*//')"
+            db_host="$(printf '%s' "$sql_dsn" | sed 's/.*@tcp(//;s/:.*//')"
+            db_port="$(printf '%s' "$sql_dsn" | sed 's/.*@tcp([^:]*://;s/)\/[^?]*.*//')"
+            db_name="$(printf '%s' "$sql_dsn" | sed 's/.*\///;s/?.*//')"
+            ( set -o pipefail
+              MYSQL_PWD="$db_pass" mysqldump \
+                  -u "$db_user" -h "$db_host" -P "${db_port:-3306}" "$db_name" \
+                  | gzip
+            ) > "$dump_file" || { rm -rf "$tmp_dir"; return 1; }
+            ;;
+        postgres)
+            if ! command -v pg_dump >/dev/null 2>&1; then
+                error "未找到 pg_dump，请先安装 PostgreSQL 客户端工具"
+                rm -rf "$tmp_dir"
+                return 1
+            fi
+            dump_file="${tmp_dir}/new-api_${timestamp}.sql.gz"
+            info "备份 PostgreSQL..."
+            # pg_dump 仅接受 URI 格式；GORM 也支持 key-value 格式，需转换（B3）
+            local pg_dsn="$sql_dsn"
+            if ! printf '%s' "$sql_dsn" | grep -qE '^postgres(ql)?://'; then
+                # key-value 格式：host=h user=u password=p dbname=d port=p
+                # 用 POSIX grep -o 避免 macOS 不支持 grep -oP 的问题（B1）
+                local pg_h pg_u pg_p pg_d pg_port
+                pg_h="$(    printf '%s' "$sql_dsn" | grep -o 'host=[^ ]*'     | cut -d= -f2)"
+                pg_u="$(    printf '%s' "$sql_dsn" | grep -o 'user=[^ ]*'     | cut -d= -f2)"
+                pg_p="$(    printf '%s' "$sql_dsn" | grep -o 'password=[^ ]*' | cut -d= -f2)"
+                pg_d="$(    printf '%s' "$sql_dsn" | grep -o 'dbname=[^ ]*'   | cut -d= -f2)"
+                pg_port="$( printf '%s' "$sql_dsn" | grep -o 'port=[^ ]*'     | cut -d= -f2)"
+                pg_dsn="postgresql://${pg_u}:${pg_p}@${pg_h}:${pg_port:-5432}/${pg_d}"
+            fi
+            ( set -o pipefail
+              pg_dump "$pg_dsn" | gzip
+            ) > "$dump_file" || { rm -rf "$tmp_dir"; return 1; }
+            ;;
+    esac
+
+    local size
+    size="$(du -sh "$dump_file" 2>/dev/null | cut -f1)"
+    info "Dump 完成: $(basename "$dump_file")（${size}）"
+    _BACKUP_DUMP_FILE="$dump_file"
+    _BACKUP_DUMP_TMP_DIR="$tmp_dir"
+}
+
+# 上传 dump 文件到 R2，并清理旧备份（只保留最近 N 个）
+backup_upload() {
+    local dump_file="$1"
+
+    if ! command -v rclone >/dev/null 2>&1; then
+        error "未找到 rclone，请先安装: https://rclone.org/install/"
+        return 1
+    fi
+
+    local account_id access_key secret_key bucket backup_dir keep
+    account_id="$(_backup_get_env R2_ACCOUNT_ID)"
+    access_key="$(_backup_get_env R2_ACCESS_KEY_ID)"
+    secret_key="$(_backup_get_env R2_SECRET_ACCESS_KEY)"
+    bucket="$(_backup_get_env R2_BUCKET)"
+    backup_dir="$(_backup_get_env R2_BACKUP_DIR "new-api-backups")"
+    keep="$(_backup_get_env R2_BACKUP_KEEP "7")"
+    # 防止 .env 被手动改为非数字导致算术崩溃（B2）
+    if ! printf '%s' "$keep" | grep -qE '^[1-9][0-9]*$'; then
+        warn "R2_BACKUP_KEEP 值无效（$keep），使用默认值 7"
+        keep=7
+    fi
+
+    local endpoint="https://${account_id}.r2.cloudflarestorage.com"
+    local r2_path="${bucket}/${backup_dir}"
+
+    info "上传到 R2: ${r2_path}/$(basename "$dump_file")"
+    rclone copy \
+        --s3-provider=Cloudflare \
+        --s3-access-key-id="$access_key" \
+        --s3-secret-access-key="$secret_key" \
+        --s3-endpoint="$endpoint" \
+        --s3-env-auth=false \
+        "$dump_file" \
+        ":s3:${r2_path}/" || { error "上传失败，请检查 R2 配置和网络连接"; return 1; }
+    info "上传成功"
+
+    # 列出远端文件（按文件名排序），清理超出保留数量的旧备份
+    info "检查旧备份（最多保留 ${keep} 个）..."
+    # 先捕获 rclone 退出码再排序，避免管道吞掉错误（同 backup_list 的修复）
+    local file_list_raw file_list=""
+    if ! file_list_raw="$(rclone lsf \
+            --s3-provider=Cloudflare \
+            --s3-access-key-id="$access_key" \
+            --s3-secret-access-key="$secret_key" \
+            --s3-endpoint="$endpoint" \
+            --s3-env-auth=false \
+            ":s3:${r2_path}/" 2>/dev/null)"; then
+        warn "列出远端文件失败，跳过旧备份清理"
+        return 0
+    fi
+    [ -n "$file_list_raw" ] && file_list="$(printf '%s\n' "$file_list_raw" | sort)"
+
+    local total=0
+    if [ -n "$file_list" ]; then
+        total="$(printf '%s\n' "$file_list" | grep -c .)" || total=0
+    fi
+    local to_delete=$(( total - keep ))
+
+    if [ "$to_delete" -gt 0 ]; then
+        local old_files deleted=0
+        old_files="$(printf '%s\n' "$file_list" | head -n "$to_delete")"
+        while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            rclone delete \
+                --s3-provider=Cloudflare \
+                --s3-access-key-id="$access_key" \
+                --s3-secret-access-key="$secret_key" \
+                --s3-endpoint="$endpoint" \
+                --s3-env-auth=false \
+                ":s3:${r2_path}/${f}" 2>/dev/null \
+                && { info "已删除旧备份: $f"; deleted=$(( deleted + 1 )); } \
+                || warn "删除失败: $f"
+        done <<EOF
+$old_files
+EOF
+        info "清理完成，共删除 ${deleted} 个旧备份"
+    else
+        info "当前共 ${total} 个备份，无需清理"
+    fi
+}
+
+# 列出 R2 上的备份文件
+backup_list() {
+    backup_check_config || return 1
+
+    if ! command -v rclone >/dev/null 2>&1; then
+        error "未找到 rclone，请先安装: https://rclone.org/install/"
+        return 1
+    fi
+
+    local account_id access_key secret_key bucket backup_dir
+    account_id="$(_backup_get_env R2_ACCOUNT_ID)"
+    access_key="$(_backup_get_env R2_ACCESS_KEY_ID)"
+    secret_key="$(_backup_get_env R2_SECRET_ACCESS_KEY)"
+    bucket="$(_backup_get_env R2_BUCKET)"
+    backup_dir="$(_backup_get_env R2_BACKUP_DIR "new-api-backups")"
+
+    local endpoint="https://${account_id}.r2.cloudflarestorage.com"
+
+    title "R2 备份列表（${bucket}/${backup_dir}）"
+    # 先捕获 rclone 退出码，再交给 sort，避免管道吞掉 rclone 错误（B3）
+    local list_output
+    list_output="$(rclone lsl \
+        --s3-provider=Cloudflare \
+        --s3-access-key-id="$access_key" \
+        --s3-secret-access-key="$secret_key" \
+        --s3-endpoint="$endpoint" \
+        --s3-env-auth=false \
+        ":s3:${bucket}/${backup_dir}/" 2>&1)" \
+        || { error "列出备份失败，请检查 R2 配置"; return 1; }
+    # sort -k4 按第4列（文件名）排序，避免按文件大小排序
+    printf '%s\n' "$list_output" | sort -k4
+}
+
+# 配置定时备份 cron（仅 Linux）
+# 运行时间：每天 19:00 UTC = 北京时间 03:00
+backup_cron() {
+    if [ "$OS_TYPE" != "linux" ]; then
+        warn "定时备份（cron）仅支持 Linux 系统，当前系统（$OS_TYPE）不支持自动配置"
+        return 0
+    fi
+
+    local script_path="$PROJECT_DIR/scripts/setup.sh"
+    local cron_marker="setup.sh backup"
+    local cron_line="0 19 * * * cd \"$PROJECT_DIR\" && \"$script_path\" backup >> /tmp/new-api-backup.log 2>&1"
+    local already_installed=false
+
+    if crontab -l 2>/dev/null | grep -qF "$cron_marker"; then
+        already_installed=true
+    fi
+
+    # 显示当前状态并询问操作
+    echo ""
+    if [ "$already_installed" = "true" ]; then
+        info "定时备份当前状态：已安装"
+        echo ""
+        crontab -l 2>/dev/null | grep "$cron_marker"
+        echo ""
+        echo "请选择操作："
+        echo "  1) 卸载定时任务"
+        echo "  2) 取消（保持不变）"
+        echo ""
+        read -r -p "请选择 [1-2]: " cron_choice || true
+        case "${cron_choice:-2}" in
+            1)
+                # 删除含 marker 的行及其上方的注释行
+                local new_crontab
+                new_crontab="$(crontab -l 2>/dev/null \
+                    | grep -v "new-api backup:" \
+                    | grep -vF "$cron_marker")" || new_crontab=""
+                # 检查过滤后是否还有有效内容（非空白行）；B4
+                if printf '%s' "$new_crontab" | grep -q '[^[:space:]]'; then
+                    printf '%s\n' "$new_crontab" | crontab - || { error "更新 crontab 失败"; return 1; }
+                else
+                    crontab -r 2>/dev/null || true
+                fi
+                info "定时备份已卸载"
+                ;;
+            *)
+                info "已取消，crontab 未修改"
+                ;;
+        esac
+    else
+        info "定时备份当前状态：未安装"
+        echo ""
+        echo "将添加以下 cron 任务："
+        echo "  $cron_line"
+        echo "  执行时间：每天 19:00 UTC（北京时间 03:00）"
+        echo "  日志文件：/tmp/new-api-backup.log"
+        echo ""
+        echo "请选择操作："
+        echo "  1) 安装定时任务"
+        echo "  2) 取消"
+        echo ""
+        read -r -p "请选择 [1-2]: " cron_choice || true
+        case "${cron_choice:-2}" in
+            1)
+                local existing new_crontab
+                existing="$(crontab -l 2>/dev/null || true)"
+                if [ -n "$existing" ]; then
+                    new_crontab="${existing}
+# new-api backup: 每天 19:00 UTC（北京时间 03:00）
+${cron_line}"
+                else
+                    new_crontab="# new-api backup: 每天 19:00 UTC（北京时间 03:00）
+${cron_line}"
+                fi
+                printf '%s\n' "$new_crontab" | crontab - || { error "写入 crontab 失败"; return 1; }
+                info "定时备份已安装"
+                info "查看 crontab : crontab -l"
+                ;;
+            *)
+                info "已取消，crontab 未修改"
+                ;;
+        esac
+    fi
+}
+
+# backup 命令主入口
+cmd_backup() {
+    local subcmd="${2:-now}"
+    case "$subcmd" in
+        setup)
+            backup_setup
+            ;;
+        cron)
+            backup_cron
+            ;;
+        list)
+            backup_list
+            ;;
+        now|"")
+            backup_check_config || return 1
+            title "执行数据库备份"
+            _BACKUP_DUMP_FILE=""
+            _BACKUP_DUMP_TMP_DIR=""
+            backup_dump || return 1
+            local _upload_ret=0
+            backup_upload "$_BACKUP_DUMP_FILE" || _upload_ret=$?
+            rm -rf "$_BACKUP_DUMP_TMP_DIR" 2>/dev/null || true
+            [ "$_upload_ret" -eq 0 ] && info "备份完成" || return 1
+            ;;
+        *)
+            error "未知 backup 子命令: $subcmd"
+            echo "用法: $0 backup [setup|cron|list]"
+            return 1
+            ;;
+    esac
+}
+
 # 显示交互式菜单
 show_menu() {
     local choice
@@ -1639,9 +2081,10 @@ show_menu() {
     echo "  7) logs           - 查看服务日志"
     echo "  8) template-dark  - 应用深色高雅风模板"
     echo "  9) template-light - 应用苹果简约风模板"
+    echo "  b) backup         - 备份数据库到 Cloudflare R2"
     echo "  0) 退出"
     echo ""
-    read -r -p "请选择操作 [0-9]: " choice || true
+    read -r -p "请选择操作 [0-9/b]: " choice || true
     case "$choice" in
         1) cmd_install ;;
         2) cmd_uninstall ;;
@@ -1652,6 +2095,7 @@ show_menu() {
         7) cmd_logs ;;
         8) cmd_template_dark ;;
         9) cmd_template_light ;;
+        b|B) cmd_backup ;;
         0) info "再见！"; exit 0 ;;
         "") info "已取消"; exit 0 ;;
         *) error "无效选择: $choice"; exit 1 ;;
@@ -1670,8 +2114,13 @@ show_help() {
     echo "  push            推送 $BRANCH_NAME 分支到 origin"
     echo "  status          查看服务状态"
     echo "  logs            查看服务日志"
-    echo "  template-dark   应用深色高雅风主题模板"
-    echo "  template-light  应用苹果简约风主题模板"
+    echo "  template-dark              应用深色高雅风主题模板"
+    echo "  template-light             应用苹果简约风主题模板"
+    echo "  backup [setup|cron|list]   备份数据库到 Cloudflare R2"
+    echo "    backup setup               交互式配置 R2 凭据（写入 .env）"
+    echo "    backup cron                配置 cron 定时任务（Linux，每天北京时间 03:00）"
+    echo "    backup list                列出 R2 上已有的备份文件"
+    echo "    backup                     立即执行一次备份"
     echo ""
     echo "不带参数运行时显示交互式菜单。"
 }
@@ -1687,6 +2136,7 @@ case "${1:-}" in
     logs)           cmd_logs ;;
     template-dark)  cmd_template_dark ;;
     template-light) cmd_template_light ;;
+    backup)         cmd_backup "$@" ;;
     -h|--help)      show_help ;;
     "")             show_menu ;;
     *)
