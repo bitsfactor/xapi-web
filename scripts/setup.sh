@@ -65,6 +65,20 @@ warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 title()   { echo -e "\n${BLUE}===== $1 =====${NC}"; }
 
+# root 时直接执行命令，否则通过 sudo 提权
+_EUID="$(id -u)"
+_sudo() { if [ "$_EUID" -eq 0 ]; then "$@"; else sudo "$@"; fi; }
+
+# apt-get install，确保 update 只执行一次
+_APT_UPDATED=0
+_apt_install() {
+    if [ "$_APT_UPDATED" -eq 0 ]; then
+        _sudo apt-get update -qq
+        _APT_UPDATED=1
+    fi
+    _sudo apt-get install -y "$@"
+}
+
 # ===== 工具函数 =====
 
 # 读取 VERSION 文件，返回版本号字符串
@@ -190,9 +204,9 @@ install_cmd() {
         case "$cmd" in
             git)
                 if command -v apt-get &>/dev/null; then
-                    sudo apt-get update && sudo apt-get install -y git
+                    _apt_install git
                 elif command -v yum &>/dev/null; then
-                    sudo yum install -y git
+                    _sudo yum install -y git
                 else
                     error "无法自动安装 git，请手动安装"
                     return 1
@@ -214,8 +228,8 @@ install_cmd() {
                     trap "rm -f '${tmp_tar}'" EXIT INT TERM
                     info "下载 Go ${go_ver}: ${url}"
                     curl -fsSL "$url" -o "$tmp_tar"
-                    sudo rm -rf /usr/local/go
-                    sudo tar -C /usr/local -xzf "$tmp_tar"
+                    _sudo rm -rf /usr/local/go
+                    _sudo tar -C /usr/local -xzf "$tmp_tar"
                 ) || return 1
                 export PATH="/usr/local/go/bin:$PATH"
                 ;;
@@ -226,9 +240,9 @@ install_cmd() {
                 if ! command -v unzip &>/dev/null; then
                     info "安装 unzip（bun 安装脚本依赖）..."
                     if command -v apt-get &>/dev/null; then
-                        sudo apt-get update -qq && sudo apt-get install -y unzip
+                        _apt_install unzip
                     elif command -v yum &>/dev/null; then
-                        sudo yum install -y unzip
+                        _sudo yum install -y unzip
                     else
                         error "无法自动安装 unzip，请手动安装后重试"
                         return 1
@@ -240,9 +254,9 @@ install_cmd() {
                 ;;
             redis)
                 if command -v apt-get &>/dev/null; then
-                    sudo apt-get update && sudo apt-get install -y redis-server
+                    _apt_install redis-server
                 elif command -v yum &>/dev/null; then
-                    sudo yum install -y redis
+                    _sudo yum install -y redis
                 else
                     error "无法自动安装 redis，请手动安装"
                     return 1
@@ -503,7 +517,7 @@ EOF
 # macOS: 发送 SIGTERM 给所有匹配进程，超时后发送 SIGKILL
 stop_service() {
     if [ "$OS_TYPE" = "linux" ]; then
-        sudo systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+        _sudo systemctl stop "$SERVICE_NAME" 2>/dev/null || true
     elif [ "$OS_TYPE" = "darwin" ]; then
         local pids
         pids="$(pgrep -x "${SERVICE_NAME}" 2>/dev/null || true)"
@@ -539,7 +553,7 @@ start_service() {
         fi
     fi
     if [ "$OS_TYPE" = "linux" ]; then
-        sudo systemctl restart "$SERVICE_NAME"
+        _sudo systemctl restart "$SERVICE_NAME"
     elif [ "$OS_TYPE" = "darwin" ]; then
         mkdir -p "$PROJECT_DIR/logs"
         # 使用 nohup 防止 SSH 断开时 SIGHUP 杀死进程；
@@ -595,10 +609,10 @@ start_redis() {
         # 先检查哪个服务单元存在，再启动，避免因服务不存在的非零退出触发 fallback
         if systemctl list-unit-files redis-server.service &>/dev/null 2>&1 \
                 && systemctl list-unit-files redis-server.service | grep -q 'redis-server'; then
-            sudo systemctl start redis-server 2>/dev/null || true
+            _sudo systemctl start redis-server 2>/dev/null || true
         elif systemctl list-unit-files redis.service &>/dev/null 2>&1 \
                 && systemctl list-unit-files redis.service | grep -q 'redis.service'; then
-            sudo systemctl start redis 2>/dev/null || true
+            _sudo systemctl start redis 2>/dev/null || true
         else
             warn "未找到 redis-server.service 或 redis.service，请手动启动 Redis"
         fi
@@ -618,10 +632,10 @@ stop_redis() {
     else
         if systemctl list-unit-files redis-server.service &>/dev/null 2>&1 \
                 && systemctl list-unit-files redis-server.service | grep -q 'redis-server'; then
-            sudo systemctl stop redis-server 2>/dev/null || true
+            _sudo systemctl stop redis-server 2>/dev/null || true
         elif systemctl list-unit-files redis.service &>/dev/null 2>&1 \
                 && systemctl list-unit-files redis.service | grep -q 'redis.service'; then
-            sudo systemctl stop redis 2>/dev/null || true
+            _sudo systemctl stop redis 2>/dev/null || true
         fi
     fi
 }
@@ -1029,9 +1043,9 @@ cmd_uninstall() {
 
     # 清理 systemd 服务（仅 Linux）
     if [ "$OS_TYPE" = "linux" ] && [ -f "$SYSTEMD_PATH" ]; then
-        sudo systemctl disable "$SERVICE_NAME" 2>/dev/null || true
-        sudo rm -f "$SYSTEMD_PATH"
-        sudo systemctl daemon-reload
+        _sudo systemctl disable "$SERVICE_NAME" 2>/dev/null || true
+        _sudo rm -f "$SYSTEMD_PATH"
+        _sudo systemctl daemon-reload
         info "已清理 systemd 服务"
     fi
 
@@ -1043,9 +1057,9 @@ cmd_uninstall() {
             brew uninstall redis 2>/dev/null || true
         else
             if command -v apt-get &>/dev/null; then
-                sudo apt-get remove -y redis-server 2>/dev/null || true
+                _sudo apt-get remove -y redis-server 2>/dev/null || true
             elif command -v yum &>/dev/null; then
-                sudo yum remove -y redis 2>/dev/null || true
+                _sudo yum remove -y redis 2>/dev/null || true
             fi
         fi
         info "Redis 已卸载"
@@ -1145,10 +1159,10 @@ cmd_install() {
         title "注册系统服务"
         local service_content
         service_content="$(generate_systemd_service)"
-        echo "$service_content" | sudo tee "$SYSTEMD_PATH" >/dev/null
+        echo "$service_content" | _sudo tee "$SYSTEMD_PATH" >/dev/null
         info "已写入 $SYSTEMD_PATH"
-        sudo systemctl daemon-reload
-        sudo systemctl enable "$SERVICE_NAME"
+        _sudo systemctl daemon-reload
+        _sudo systemctl enable "$SERVICE_NAME"
     fi
 
     # 启动服务
@@ -1324,7 +1338,7 @@ cmd_push() {
 cmd_status() {
     title "服务状态"
     if [ "$OS_TYPE" = "linux" ]; then
-        sudo systemctl status "$SERVICE_NAME" --no-pager || true
+        _sudo systemctl status "$SERVICE_NAME" --no-pager || true
     elif [ "$OS_TYPE" = "darwin" ]; then
         # macOS 下按进程名精确匹配检查是否在运行
         local pid
@@ -1354,7 +1368,7 @@ cmd_logs() {
     title "服务日志"
     local log_dir="$PROJECT_DIR/logs"
     if [ "$OS_TYPE" = "linux" ]; then
-        sudo journalctl -u "$SERVICE_NAME" -f --no-pager -n 100
+        _sudo journalctl -u "$SERVICE_NAME" -f --no-pager -n 100
     elif [ "$OS_TYPE" = "darwin" ]; then
         if [ -d "$log_dir" ]; then
             local log_count
