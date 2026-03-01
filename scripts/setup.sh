@@ -733,7 +733,7 @@ _print_credentials() {
 }
 
 # 初始化管理员凭据（全新数据库场景）
-# 通过 /api/setup 创建初始管理员，登录后获取 Access Token 并保存到 config.json
+# 通过 /api/setup 创建初始管理员，登录后获取 Access Token 并写入 .env
 # 依赖: 全局变量 PY、PORT、SCRIPT_DIR
 _init_admin_credentials() {
     local ADMIN_PASS
@@ -811,7 +811,7 @@ print(json.dumps({'username': 'admin', 'password': pw}))
     trap - EXIT INT TERM
     ACCESS_TOKEN="$(py_json_get "$TOKEN_RESP" "data")" || true
 
-    # 先打印凭据，确保即使 config.json 写入失败也不丢失
+    # 先打印凭据，确保即使 .env 写入失败也不丢失
     _print_credentials "$PORT" "admin" "$ADMIN_PASS" "$ACCESS_TOKEN"
 
     if [ -z "$ACCESS_TOKEN" ]; then
@@ -819,27 +819,145 @@ print(json.dumps({'username': 'admin', 'password': pw}))
         return 0
     fi
 
-    # 通过环境变量传递敏感信息，避免出现在 ps 命令输出中
-    if NEW_API_SERVER="http://localhost:$PORT" \
-       NEW_API_TOKEN="$ACCESS_TOKEN" \
-       NEW_API_PASS="$ADMIN_PASS" \
-       NEW_API_USER_ID="$USER_ID" \
-       "$PY" -c "
-import json, sys, os
-config = {
-    'server': os.environ['NEW_API_SERVER'],
-    'token': os.environ['NEW_API_TOKEN'],
-    'user_id': os.environ['NEW_API_USER_ID'],
-    'username': 'admin',
-    'password': os.environ['NEW_API_PASS']
-}
-with open(sys.argv[1], 'w') as f:
-    json.dump(config, f, indent=2, ensure_ascii=False)
-" "$SCRIPT_DIR/config.json"; then
-        chmod 600 "$SCRIPT_DIR/config.json"
-        info "凭据已保存到: $SCRIPT_DIR/config.json"
+    # 幂等写入三个管理员凭据变量到 .env
+    local _env_write_ok=true
+    # 写入 ADMIN_SERVER
+    if grep -qE '^ADMIN_SERVER=.+' "$PROJECT_DIR/.env" 2>/dev/null; then
+        local _tmp1
+        _tmp1="$(mktemp)" && chmod 600 "$_tmp1" \
+            && awk -v val="http://localhost:$PORT" \
+                '/^ADMIN_SERVER=/ { print "ADMIN_SERVER=" val; next } { print }' \
+                "$PROJECT_DIR/.env" > "$_tmp1" \
+            && mv "$_tmp1" "$PROJECT_DIR/.env" || { rm -f "$_tmp1"; _env_write_ok=false; }
     else
-        warn "config.json 写入失败，请手动记录上述凭据"
+        echo "ADMIN_SERVER=http://localhost:$PORT" >> "$PROJECT_DIR/.env" || _env_write_ok=false
+    fi
+    # 写入 ADMIN_TOKEN
+    if grep -qE '^ADMIN_TOKEN=.+' "$PROJECT_DIR/.env" 2>/dev/null; then
+        local _tmp2
+        _tmp2="$(mktemp)" && chmod 600 "$_tmp2" \
+            && awk -v val="$ACCESS_TOKEN" \
+                '/^ADMIN_TOKEN=/ { print "ADMIN_TOKEN=" val; next } { print }' \
+                "$PROJECT_DIR/.env" > "$_tmp2" \
+            && mv "$_tmp2" "$PROJECT_DIR/.env" || { rm -f "$_tmp2"; _env_write_ok=false; }
+    else
+        echo "ADMIN_TOKEN=$ACCESS_TOKEN" >> "$PROJECT_DIR/.env" || _env_write_ok=false
+    fi
+    # 写入 ADMIN_USER_ID
+    if grep -qE '^ADMIN_USER_ID=.+' "$PROJECT_DIR/.env" 2>/dev/null; then
+        local _tmp3
+        _tmp3="$(mktemp)" && chmod 600 "$_tmp3" \
+            && awk -v val="$USER_ID" \
+                '/^ADMIN_USER_ID=/ { print "ADMIN_USER_ID=" val; next } { print }' \
+                "$PROJECT_DIR/.env" > "$_tmp3" \
+            && mv "$_tmp3" "$PROJECT_DIR/.env" || { rm -f "$_tmp3"; _env_write_ok=false; }
+    else
+        echo "ADMIN_USER_ID=$USER_ID" >> "$PROJECT_DIR/.env" || _env_write_ok=false
+    fi
+    if [ "$_env_write_ok" = "true" ]; then
+        info "管理员凭据已写入 .env (ADMIN_SERVER / ADMIN_TOKEN / ADMIN_USER_ID)"
+    else
+        warn ".env 凭据写入失败，请手动记录上述信息"
+    fi
+}
+
+# ===== 模板工具函数（template-dark / template-light 子命令共用）=====
+
+_TEMPLATE_TMPFILES=()
+_template_cleanup() { rm -f "${_TEMPLATE_TMPFILES[@]}" 2>/dev/null; }
+
+# 从 .env 加载 ADMIN_SERVER / ADMIN_TOKEN / ADMIN_USER_ID 到 SERVER / TOKEN / USER_ID
+# 依赖: 全局变量 PY、PROJECT_DIR
+_load_template_config() {
+    if [ -z "$PY" ]; then
+        error "需要 python3 或 python，请先安装"; exit 1
+    fi
+    if ! command -v curl &>/dev/null; then
+        error "需要 curl，请先安装"; exit 1
+    fi
+    local env_file="$PROJECT_DIR/.env"
+    if [ ! -f "$env_file" ]; then
+        error "未找到 .env 文件"
+        echo "请先运行: ./scripts/setup.sh install"
+        exit 1
+    fi
+    SERVER=$(grep -E '^ADMIN_SERVER=' "$env_file" 2>/dev/null | cut -d= -f2- | head -1)
+    TOKEN=$(grep  -E '^ADMIN_TOKEN='  "$env_file" 2>/dev/null | cut -d= -f2- | head -1)
+    USER_ID=$(grep -E '^ADMIN_USER_ID=' "$env_file" 2>/dev/null | cut -d= -f2- | head -1)
+    if [ -z "$TOKEN" ] || [ -z "$USER_ID" ]; then
+        error ".env 中缺少 ADMIN_TOKEN 或 ADMIN_USER_ID"
+        echo "请重新运行: ./scripts/setup.sh install"
+        exit 1
+    fi
+}
+
+# 从 stdin 读取值，调用 API 写入单个选项
+# 用法：printf 'value' | set_option "Key"
+#       cat <<'EOF' | set_option "Key"
+#       multi-line value
+#       EOF
+# 依赖: 全局变量 PY、SERVER、TOKEN、USER_ID、_TEMPLATE_TMPFILES
+set_option() {
+    local key="$1"
+    local value
+    value=$(cat)
+    local tmpfile
+    tmpfile=$(mktemp)
+    _TEMPLATE_TMPFILES+=("$tmpfile")
+
+    printf '%s' "$value" | "$PY" -c "
+import json, sys
+key = sys.argv[1]
+value = sys.stdin.read()
+with open(sys.argv[2], 'w') as f:
+    json.dump({'key': key, 'value': value}, f)
+" "$key" "$tmpfile"
+
+    local response curl_err
+    curl_err=$(mktemp)
+    _TEMPLATE_TMPFILES+=("$curl_err")
+    response=$(curl -s -X PUT "${SERVER}/api/option/" \
+        -H "Authorization: Bearer ${TOKEN}" \
+        -H "New-Api-User: ${USER_ID}" \
+        -H "Content-Type: application/json" \
+        -d "@${tmpfile}" 2>"$curl_err") || true
+
+    rm -f "$tmpfile"
+
+    if [ -z "$response" ]; then
+        local err_detail
+        err_detail=$(cat "$curl_err")
+        rm -f "$curl_err"
+        echo "  ✗ $key - 网络连接失败: ${err_detail:-服务器无响应}"
+        return 1
+    fi
+
+    rm -f "$curl_err"
+
+    if printf '%s' "$response" | "$PY" -c "import json,sys; exit(0 if json.load(sys.stdin).get('success') else 1)" 2>/dev/null; then
+        echo "  ✓ $key"
+    else
+        local msg
+        msg=$(printf '%s' "$response" | "$PY" -c "
+import json,sys
+try:
+  d=json.load(sys.stdin); print(d.get('message','未知错误'))
+except:
+  print(sys.stdin.read())
+" 2>/dev/null)
+        echo "  ✗ $key - ${msg:-$response}"
+
+        # 认证失败时提前终止，避免重复相同错误
+        if printf '%s' "$response" | "$PY" -c "
+import json,sys
+d=json.load(sys.stdin)
+m=d.get('message','')
+sys.exit(0 if any(k in m for k in ['token','无权','未登录','unauthorized']) else 1)
+" 2>/dev/null; then
+            echo ""
+            echo "错误：认证失败，请检查 .env 中的 ADMIN_TOKEN 是否正确。"
+            exit 1
+        fi
     fi
 }
 
@@ -926,9 +1044,6 @@ cmd_uninstall() {
     info "源码、git 仓库和 upstream remote 配置已保留"
     if [ -f "$PROJECT_DIR/one-api.db" ]; then
         info "数据库文件已保留: $PROJECT_DIR/one-api.db"
-    fi
-    if [ -f "$SCRIPT_DIR/config.json" ]; then
-        info "凭据文件已保留: $SCRIPT_DIR/config.json"
     fi
     info "可随时重新运行 ./scripts/setup.sh install"
 }
@@ -1068,12 +1183,12 @@ cmd_install() {
                 SETUP_STATUS="$(py_json_get "$SETUP_RESP" "data.status")" || true
 
                 if [ "$SETUP_STATUS" = "true" ]; then
-                    # 系统已初始化，检查是否有已保存的凭据
-                    if [ -f "$SCRIPT_DIR/config.json" ]; then
-                        info "系统已初始化，凭据文件已存在: $SCRIPT_DIR/config.json"
+                    # 系统已初始化，检查 .env 中是否存在 ADMIN_TOKEN
+                    if grep -qE '^ADMIN_TOKEN=.+' "$PROJECT_DIR/.env" 2>/dev/null; then
+                        info "系统已初始化，管理员凭据已存在于 .env"
                     else
                         info "系统已初始化（已有数据库），跳过凭据初始化"
-                        warn "未找到凭据文件 $SCRIPT_DIR/config.json"
+                        warn "未在 .env 中找到 ADMIN_TOKEN"
                         warn "请使用原有管理员密码登录: http://localhost:$PORT"
                         warn "如忘记密码，请参考文档通过数据库重置"
                     fi
@@ -1250,22 +1365,283 @@ cmd_logs() {
     fi
 }
 
+# template-dark: 应用深色高雅风主题模板
+cmd_template_dark() {
+    _load_template_config
+    _TEMPLATE_TMPFILES=()
+    trap _template_cleanup EXIT INT TERM
+    echo "🌙 正在应用 [深色高雅风] 模板..."
+    echo "   服务器: $SERVER"
+    echo ""
+    echo "Develop API"            | set_option "SystemName"
+    echo "/logo-dark.svg"         | set_option "Logo"
+    echo "https://api.develop.cc" | set_option "ServerAddress"
+    cat <<'HTMLEOF' | set_option "HomePageContent"
+<style>
+.da-dark-bg{background:#0A0A0A;min-height:calc(100vh - 60px);min-height:calc(100dvh - 60px);width:100%}
+.da-dark-wrap{font-family:Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#E5E5E5;max-width:960px;margin:0 auto;padding:0 20px}
+.da-dark-hero{text-align:center;padding:80px 0 60px;position:relative;overflow:visible}
+.da-dark-hero::before{content:'';position:absolute;top:0;left:50%;transform:translateX(-50%);width:600px;height:600px;background:radial-gradient(circle,rgba(212,165,116,0.08) 0%,transparent 70%);pointer-events:none}
+.da-dark-hero h1{font-size:52px;font-weight:700;letter-spacing:-0.02em;line-height:1.1;margin:0;background:linear-gradient(135deg,#D4A574,#C9956B);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;color:transparent;position:relative}
+.da-dark-hero .da-sub{font-size:20px;color:#888;margin-top:16px;line-height:1.4;max-width:560px;margin-left:auto;margin-right:auto;position:relative}
+.da-dark-addr{margin-top:32px;background:#111;border:1px solid #2A2A2A;border-radius:10px;padding:16px 28px;display:inline-block;position:relative}
+.da-dark-addr .da-label{color:#888;font-size:13px;text-transform:uppercase;letter-spacing:0.05em}
+.da-dark-addr .da-url{font-size:17px;font-weight:600;color:#D4A574;margin-top:4px;font-family:'SF Mono',SFMono-Regular,Menlo,monospace}
+.da-dark-cta{display:inline-block;background:linear-gradient(135deg,#D4A574,#C9956B);color:#0A0A0A;padding:12px 28px;border-radius:8px;font-size:16px;font-weight:600;text-decoration:none;margin-top:24px;transition:opacity 0.3s;position:relative}
+.da-dark-cta:hover{opacity:0.9;color:#0A0A0A}
+.da-dark-features{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;padding:40px 0}
+.da-dark-card{background:#111;border:1px solid #2A2A2A;border-radius:12px;padding:28px;text-align:center;transition:border-color 0.3s}
+.da-dark-card:hover{border-color:#D4A574}
+.da-dark-card .da-icon{font-size:32px;margin-bottom:16px;background:linear-gradient(135deg,#D4A574,#C9956B);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;color:transparent}
+.da-dark-card h3{font-size:17px;font-weight:600;color:#E5E5E5;margin:0 0 8px}
+.da-dark-card p{font-size:14px;color:#888;margin:0;line-height:1.5}
+.da-dark-models{padding:40px 0 80px;text-align:center}
+.da-dark-models h2{font-size:28px;font-weight:700;color:#E5E5E5;margin:0 0 24px}
+.da-dark-tags{display:flex;flex-wrap:wrap;gap:8px;justify-content:center}
+.da-dark-tag{padding:6px 14px;border-radius:6px;font-size:13px;font-weight:500;background:#1A1A1A;border:1px solid #2A2A2A;color:#999;transition:border-color 0.3s}
+.da-dark-tag:hover{border-color:#D4A574;color:#D4A574}
+@media(max-width:768px){
+  .da-dark-hero h1{font-size:34px}
+  .da-dark-hero .da-sub{font-size:16px}
+  .da-dark-features{grid-template-columns:1fr}
+}
+</style>
+<div class="da-dark-bg">
+  <div class="da-dark-wrap">
+    <div class="da-dark-hero">
+      <h1>AI API Gateway</h1>
+      <p class="da-sub">Unified interface to 40+ AI models. One API, endless possibilities.</p>
+      <div class="da-dark-addr">
+        <div class="da-label">Endpoint</div>
+        <div class="da-url">https://api.develop.cc</div>
+      </div>
+      <div><a href="/token" class="da-dark-cta">Get Started</a></div>
+    </div>
+    <div class="da-dark-features">
+      <div class="da-dark-card">
+        <div class="da-icon">◆</div>
+        <h3>Unified Interface</h3>
+        <p>OpenAI-compatible API format. Connect to all major models through a single endpoint.</p>
+      </div>
+      <div class="da-dark-card">
+        <div class="da-icon">◈</div>
+        <h3>40+ Models</h3>
+        <p>GPT-4o, Claude, Gemini, DeepSeek and more. Switch models with a single parameter change.</p>
+      </div>
+      <div class="da-dark-card">
+        <div class="da-icon">◇</div>
+        <h3>Enterprise Ready</h3>
+        <p>Key isolation, rate limiting, usage tracking, and high-availability architecture built in.</p>
+      </div>
+    </div>
+    <div class="da-dark-models">
+      <h2>Supported Models</h2>
+      <div class="da-dark-tags">
+        <span class="da-dark-tag">GPT-4o</span>
+        <span class="da-dark-tag">GPT-4o-mini</span>
+        <span class="da-dark-tag">o1</span>
+        <span class="da-dark-tag">o3-mini</span>
+        <span class="da-dark-tag">Claude 3.5 Sonnet</span>
+        <span class="da-dark-tag">Claude 3 Opus</span>
+        <span class="da-dark-tag">Claude 3 Haiku</span>
+        <span class="da-dark-tag">Gemini 2.0</span>
+        <span class="da-dark-tag">Gemini 1.5 Pro</span>
+        <span class="da-dark-tag">DeepSeek V3</span>
+        <span class="da-dark-tag">DeepSeek R1</span>
+        <span class="da-dark-tag">Llama 3</span>
+        <span class="da-dark-tag">Mistral</span>
+        <span class="da-dark-tag">More...</span>
+      </div>
+    </div>
+  </div>
+</div>
+HTMLEOF
+    cat <<'HTMLEOF' | set_option "Footer"
+<style>.custom-footer + div { display: none !important; } body,body[theme-mode],body[theme-mode="dark"]{--semi-color-text-0:#E5E5E5;--semi-color-text-1:#999;--semi-color-text-2:#666;--semi-color-primary:#D4A574;--semi-color-primary-hover:#C9956B;--semi-color-fill-0:#1A1A1A;--semi-color-fill-1:#222;--semi-color-fill-2:#2A2A2A;--semi-color-bg-0:#0A0A0A;--semi-color-bg-1:#111;--semi-color-bg-2:#1A1A1A;--semi-color-primary-light-default:rgba(212,165,116,0.15);--semi-color-bg-overlay:#111;--semi-color-border:#2A2A2A} header.sticky{background-color:rgba(10,10,10,0.85)!important;border-bottom:1px solid #2A2A2A!important}
+/* ===== /pricing 页面深色适配 ===== */
+/* 注：:has() 需要 Chrome 105+ / Firefox 121+ / Safari 15.4+，覆盖所有主流现代浏览器 */
+.bg-white:has(.pricing-layout){background:#0A0A0A!important}
+.pricing-layout .text-gray-900,.pricing-search-header .text-gray-900{color:#E5E5E5!important}
+.pricing-layout .text-gray-800,.pricing-search-header .text-gray-800{color:#D4D4D4!important}
+.pricing-layout .text-gray-700,.pricing-search-header .text-gray-700{color:#BABABA!important}
+.pricing-layout .text-gray-600,.pricing-search-header .text-gray-600{color:#999!important}
+.pricing-layout .text-gray-500,.pricing-search-header .text-gray-500{color:#888!important}
+.pricing-layout .border-gray-200,.pricing-layout .border-gray-300{border-color:#2A2A2A!important}
+.pricing-layout .border-blue-500{border-color:#D4A574!important}
+.pricing-layout .bg-blue-50{background:rgba(212,165,116,0.1)!important}</style>
+<div style="text-align:center;padding:20px 0;font-family:Inter,-apple-system,sans-serif;color:#888;font-size:13px;border-top:1px solid rgba(212,165,116,0.3);background:#0A0A0A;">
+  <span>© 2025–2026 <a href="https://develop.cc" target="_blank" style="color:#D4A574;text-decoration:none;">BitFactor LLC</a></span>
+</div>
+HTMLEOF
+    cat <<'HTMLEOF' | set_option "About"
+<div style="background:#0A0A0A;min-height:calc(100vh - 120px);min-height:calc(100dvh - 120px);margin:0 -0.5rem;padding:0 0.5rem;">
+  <div style="max-width:680px;margin:0 auto;font-family:Inter,-apple-system,sans-serif;color:#E5E5E5;line-height:1.6;padding:40px 20px;">
+    <h2 style="font-size:32px;font-weight:700;margin:0 0 16px;background:linear-gradient(135deg,#D4A574,#C9956B);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;color:transparent;">Develop API</h2>
+    <p style="font-size:17px;color:#888;margin:0 0 32px;">AI API Gateway · Powered by BitFactor LLC</p>
+    <div style="background:#111;border:1px solid #2A2A2A;border-radius:10px;padding:24px;margin-bottom:20px;">
+      <h3 style="font-size:17px;font-weight:600;color:#E5E5E5;margin:0 0 12px;">About Us</h3>
+      <p style="font-size:15px;color:#999;margin:0;line-height:1.6;">Develop API is an AI API aggregation gateway operated by BitFactor LLC. We provide a unified OpenAI-compatible interface to 40+ mainstream AI models, enabling developers to rapidly integrate AI capabilities into their applications.</p>
+    </div>
+    <div style="background:#111;border:1px solid #2A2A2A;border-radius:10px;padding:24px;">
+      <h3 style="font-size:17px;font-weight:600;color:#E5E5E5;margin:0 0 12px;">Contact</h3>
+      <p style="font-size:15px;color:#999;margin:0;">Website: <a href="https://develop.cc" target="_blank" style="color:#D4A574;text-decoration:none;">develop.cc</a></p>
+    </div>
+  </div>
+</div>
+HTMLEOF
+    trap - EXIT INT TERM
+    _template_cleanup
+    echo ""
+    echo "✅ 深色高雅风模板应用完成！请刷新浏览器查看效果。"
+    echo ""
+    echo "提示：如需生产环境使用 Logo，请执行 cd web && bun run build 重新构建前端，"
+    echo "      或将 Logo 选项改为外部图片 URL。"
+}
+
+# template-light: 应用苹果简约风主题模板
+cmd_template_light() {
+    _load_template_config
+    _TEMPLATE_TMPFILES=()
+    trap _template_cleanup EXIT INT TERM
+    echo "☀️  正在应用 [苹果简约风] 模板..."
+    echo "   服务器: $SERVER"
+    echo ""
+    echo "Develop API"            | set_option "SystemName"
+    echo "/logo-apple.svg"        | set_option "Logo"
+    echo "https://api.develop.cc" | set_option "ServerAddress"
+    cat <<'HTMLEOF' | set_option "HomePageContent"
+<style>
+.al-bg{background:#FBFBFD;min-height:calc(100vh - 60px);min-height:calc(100dvh - 60px);width:100%}
+.al-wrap{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','SF Pro Text','Helvetica Neue',Arial,sans-serif;color:#1D1D1F;max-width:960px;margin:0 auto;padding:0 20px}
+.al-hero{text-align:center;padding:88px 0 72px;position:relative}
+.al-hero::before{content:'';position:absolute;top:0;left:50%;transform:translateX(-50%);width:800px;height:480px;background:radial-gradient(ellipse at 50% 0%,rgba(0,113,227,0.06) 0%,transparent 65%);pointer-events:none}
+.al-hero h1{font-size:56px;font-weight:700;letter-spacing:-0.03em;line-height:1.07;margin:0;color:#1D1D1F;position:relative}
+.al-hero .al-sub{font-size:21px;font-weight:400;color:#6E6E73;margin:12px auto 0;line-height:1.4;max-width:520px;position:relative}
+.al-endpoint{margin-top:36px;background:#FFFFFF;border-radius:14px;padding:16px 28px;display:inline-block;box-shadow:0 2px 20px rgba(0,0,0,0.08),0 0 0 1px rgba(0,0,0,0.04);position:relative}
+.al-endpoint .al-label{color:#86868B;font-size:11px;text-transform:uppercase;letter-spacing:0.06em;font-weight:500}
+.al-endpoint .al-url{font-size:17px;font-weight:600;color:#0071E3;margin-top:4px;font-family:'SF Mono',SFMono-Regular,Menlo,Courier,monospace}
+.al-cta{display:inline-block;background:#0071E3;color:#FFFFFF;padding:13px 28px;border-radius:980px;font-size:17px;font-weight:400;text-decoration:none;margin-top:28px;transition:background 0.2s;position:relative;letter-spacing:-0.01em}
+.al-cta:hover{background:#0077ED;color:#FFFFFF}
+.al-features-wrap{background:#F5F5F7;padding:64px 20px}
+.al-features{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;max-width:960px;margin:0 auto}
+.al-card{background:#FFFFFF;border-radius:18px;padding:32px 28px;box-shadow:0 2px 12px rgba(0,0,0,0.05)}
+.al-card .al-icon{width:44px;height:44px;border-radius:10px;background:#E5F0FF;display:flex;align-items:center;justify-content:center;margin-bottom:20px;font-size:20px;color:#0071E3}
+.al-card h3{font-size:17px;font-weight:600;color:#1D1D1F;margin:0 0 8px;letter-spacing:-0.01em}
+.al-card p{font-size:14px;color:#6E6E73;margin:0;line-height:1.6}
+.al-models{padding:64px 0 88px;text-align:center}
+.al-models h2{font-size:32px;font-weight:700;color:#1D1D1F;margin:0 0 28px;letter-spacing:-0.02em}
+.al-tags{display:flex;flex-wrap:wrap;gap:8px;justify-content:center}
+.al-tag{padding:7px 16px;border-radius:980px;font-size:13px;font-weight:400;background:#F5F5F7;color:#1D1D1F;transition:background 0.2s,color 0.2s;letter-spacing:-0.01em}
+.al-tag:hover{background:#E5F0FF;color:#0071E3}
+@media(max-width:768px){
+  .al-hero h1{font-size:36px}
+  .al-hero .al-sub{font-size:17px}
+  .al-features{grid-template-columns:1fr}
+}
+</style>
+<div class="al-bg">
+  <div class="al-wrap">
+    <div class="al-hero">
+      <h1>AI API Gateway</h1>
+      <p class="al-sub">Unified interface to 40+ AI models. One API, endless possibilities.</p>
+      <div class="al-endpoint">
+        <div class="al-label">Endpoint</div>
+        <div class="al-url">https://api.develop.cc</div>
+      </div>
+      <div><a href="/token" class="al-cta">Get Started</a></div>
+    </div>
+  </div>
+  <div class="al-features-wrap">
+    <div class="al-features">
+      <div class="al-card">
+        <div class="al-icon">◆</div>
+        <h3>Unified Interface</h3>
+        <p>OpenAI-compatible API format. Connect to all major models through a single endpoint.</p>
+      </div>
+      <div class="al-card">
+        <div class="al-icon">◈</div>
+        <h3>40+ Models</h3>
+        <p>GPT-4o, Claude, Gemini, DeepSeek and more. Switch models with a single parameter change.</p>
+      </div>
+      <div class="al-card">
+        <div class="al-icon">◇</div>
+        <h3>Enterprise Ready</h3>
+        <p>Key isolation, rate limiting, usage tracking, and high-availability architecture built in.</p>
+      </div>
+    </div>
+  </div>
+  <div class="al-wrap">
+    <div class="al-models">
+      <h2>Supported Models</h2>
+      <div class="al-tags">
+        <span class="al-tag">GPT-4o</span>
+        <span class="al-tag">GPT-4o-mini</span>
+        <span class="al-tag">o1</span>
+        <span class="al-tag">o3-mini</span>
+        <span class="al-tag">Claude 3.5 Sonnet</span>
+        <span class="al-tag">Claude 3 Opus</span>
+        <span class="al-tag">Claude 3 Haiku</span>
+        <span class="al-tag">Gemini 2.0</span>
+        <span class="al-tag">Gemini 1.5 Pro</span>
+        <span class="al-tag">DeepSeek V3</span>
+        <span class="al-tag">DeepSeek R1</span>
+        <span class="al-tag">Llama 3</span>
+        <span class="al-tag">Mistral</span>
+        <span class="al-tag">More...</span>
+      </div>
+    </div>
+  </div>
+</div>
+HTMLEOF
+    cat <<'HTMLEOF' | set_option "Footer"
+<style>.custom-footer + div { display: none !important; } body,body[theme-mode],body[theme-mode="dark"],body[theme-mode="light"]{--semi-color-text-0:#1D1D1F;--semi-color-text-1:#6E6E73;--semi-color-text-2:#86868B;--semi-color-primary:#0071E3;--semi-color-primary-hover:#0077ED;--semi-color-fill-0:#F5F5F7;--semi-color-fill-1:#EBEBEB;--semi-color-fill-2:#E0E0E0;--semi-color-bg-0:#FFFFFF;--semi-color-bg-1:#F5F5F7;--semi-color-bg-2:#EBEBEB;--semi-color-primary-light-default:rgba(0,113,227,0.1);--semi-color-bg-overlay:#FFFFFF;--semi-color-border:#D2D2D7} header.sticky{background-color:rgba(255,255,255,0.85)!important;backdrop-filter:saturate(180%) blur(20px)!important;-webkit-backdrop-filter:saturate(180%) blur(20px)!important;border-bottom:1px solid rgba(0,0,0,0.08)!important}</style>
+<div style="text-align:center;padding:20px 0;font-family:-apple-system,BlinkMacSystemFont,sans-serif;color:#86868B;font-size:13px;border-top:1px solid #D2D2D7;background:#FBFBFD;">
+  <span>© 2025–2026 <a href="https://develop.cc" target="_blank" style="color:#0071E3;text-decoration:none;">BitFactor LLC</a></span>
+</div>
+HTMLEOF
+    cat <<'HTMLEOF' | set_option "About"
+<div style="background:#FBFBFD;min-height:calc(100vh - 120px);min-height:calc(100dvh - 120px);margin:0 -0.5rem;padding:0 0.5rem;">
+  <div style="max-width:680px;margin:0 auto;font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Helvetica Neue',Arial,sans-serif;color:#1D1D1F;line-height:1.6;padding:56px 20px;">
+    <h2 style="font-size:36px;font-weight:700;margin:0 0 8px;color:#1D1D1F;letter-spacing:-0.025em;">Develop API</h2>
+    <p style="font-size:17px;color:#6E6E73;margin:0 0 40px;font-weight:400;">AI API Gateway · Powered by BitFactor LLC</p>
+    <div style="background:#FFFFFF;border-radius:18px;padding:28px;margin-bottom:14px;box-shadow:0 2px 12px rgba(0,0,0,0.05);">
+      <h3 style="font-size:17px;font-weight:600;color:#1D1D1F;margin:0 0 10px;letter-spacing:-0.01em;">About Us</h3>
+      <p style="font-size:15px;color:#6E6E73;margin:0;line-height:1.6;">Develop API is an AI API aggregation gateway operated by BitFactor LLC. We provide a unified OpenAI-compatible interface to 40+ mainstream AI models, enabling developers to rapidly integrate AI capabilities into their applications.</p>
+    </div>
+    <div style="background:#FFFFFF;border-radius:18px;padding:28px;box-shadow:0 2px 12px rgba(0,0,0,0.05);">
+      <h3 style="font-size:17px;font-weight:600;color:#1D1D1F;margin:0 0 10px;letter-spacing:-0.01em;">Contact</h3>
+      <p style="font-size:15px;color:#6E6E73;margin:0;">Website: <a href="https://develop.cc" target="_blank" style="color:#0071E3;text-decoration:none;">develop.cc</a></p>
+    </div>
+  </div>
+</div>
+HTMLEOF
+    trap - EXIT INT TERM
+    _template_cleanup
+    echo ""
+    echo "✅ 苹果简约风模板应用完成！请刷新浏览器查看效果。"
+    echo ""
+    echo "提示：如需生产环境使用 Logo，请执行 cd web && bun run build 重新构建前端，"
+    echo "      或将 Logo 选项改为外部图片 URL。"
+}
+
 # 显示交互式菜单
 show_menu() {
     local choice
     echo ""
     echo -e "${BLUE}===== New API 维护脚本 =====${NC}"
     echo ""
-    echo "  1) install   - 初始化项目、编译并启动"
-    echo "  2) uninstall - 卸载服务、清理所有产物"
-    echo "  3) rebuild   - 重新编译并重启"
-    echo "  4) pull      - 从上游同步更新"
-    echo "  5) push      - 推送到远程仓库"
-    echo "  6) status    - 查看服务状态"
-    echo "  7) logs      - 查看服务日志"
+    echo "  1) install        - 初始化项目、编译并启动"
+    echo "  2) uninstall      - 卸载服务、清理所有产物"
+    echo "  3) rebuild        - 重新编译并重启"
+    echo "  4) pull           - 从上游同步更新"
+    echo "  5) push           - 推送到远程仓库"
+    echo "  6) status         - 查看服务状态"
+    echo "  7) logs           - 查看服务日志"
+    echo "  8) template-dark  - 应用深色高雅风模板"
+    echo "  9) template-light - 应用苹果简约风模板"
     echo "  0) 退出"
     echo ""
-    read -r -p "请选择操作 [0-7]: " choice || true
+    read -r -p "请选择操作 [0-9]: " choice || true
     case "$choice" in
         1) cmd_install ;;
         2) cmd_uninstall ;;
@@ -1274,6 +1650,8 @@ show_menu() {
         5) cmd_push ;;
         6) cmd_status ;;
         7) cmd_logs ;;
+        8) cmd_template_dark ;;
+        9) cmd_template_light ;;
         0) info "再见！"; exit 0 ;;
         "") info "已取消"; exit 0 ;;
         *) error "无效选择: $choice"; exit 1 ;;
@@ -1285,28 +1663,32 @@ show_help() {
     echo "用法: $0 [命令]"
     echo ""
     echo "命令:"
-    echo "  install     初始化项目、编译并启动服务"
-    echo "  uninstall   卸载服务、删除所有 install 产物"
-    echo "  rebuild     重新编译并重启服务"
-    echo "  pull        从上游同步更新到 $BRANCH_NAME 分支"
-    echo "  push        推送 $BRANCH_NAME 分支到 origin"
-    echo "  status      查看服务状态"
-    echo "  logs        查看服务日志"
+    echo "  install         初始化项目、编译并启动服务"
+    echo "  uninstall       卸载服务、删除所有 install 产物"
+    echo "  rebuild         重新编译并重启服务"
+    echo "  pull            从上游同步更新到 $BRANCH_NAME 分支"
+    echo "  push            推送 $BRANCH_NAME 分支到 origin"
+    echo "  status          查看服务状态"
+    echo "  logs            查看服务日志"
+    echo "  template-dark   应用深色高雅风主题模板"
+    echo "  template-light  应用苹果简约风主题模板"
     echo ""
     echo "不带参数运行时显示交互式菜单。"
 }
 
 # ===== 入口 =====
 case "${1:-}" in
-    install)   cmd_install ;;
-    uninstall) cmd_uninstall ;;
-    rebuild)   cmd_rebuild ;;
-    pull)      cmd_pull ;;
-    push)      cmd_push ;;
-    status)    cmd_status ;;
-    logs)      cmd_logs ;;
-    -h|--help) show_help ;;
-    "")      show_menu ;;
+    install)        cmd_install ;;
+    uninstall)      cmd_uninstall ;;
+    rebuild)        cmd_rebuild ;;
+    pull)           cmd_pull ;;
+    push)           cmd_push ;;
+    status)         cmd_status ;;
+    logs)           cmd_logs ;;
+    template-dark)  cmd_template_dark ;;
+    template-light) cmd_template_light ;;
+    -h|--help)      show_help ;;
+    "")             show_menu ;;
     *)
         error "未知命令: $1"
         echo ""
