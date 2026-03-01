@@ -222,6 +222,18 @@ install_cmd() {
             bun)
                 # 安全提示：以下命令从 bun.sh 下载并执行安装脚本。
                 # 请确认信任该来源（https://bun.sh）后再继续。
+                # bun 官方安装脚本依赖 unzip，先确保其存在
+                if ! command -v unzip &>/dev/null; then
+                    info "安装 unzip（bun 安装脚本依赖）..."
+                    if command -v apt-get &>/dev/null; then
+                        sudo apt-get update -qq && sudo apt-get install -y unzip
+                    elif command -v yum &>/dev/null; then
+                        sudo yum install -y unzip
+                    else
+                        error "无法自动安装 unzip，请手动安装后重试"
+                        return 1
+                    fi
+                fi
                 curl -fsSL https://bun.sh/install | bash
                 export BUN_INSTALL="$HOME/.bun"
                 export PATH="$BUN_INSTALL/bin:$PATH"
@@ -1631,13 +1643,13 @@ _backup_env_write() {
     local var="$1" val="$2"
     local env_file="$PROJECT_DIR/.env"
     touch "$env_file" 2>/dev/null || true
-    if grep -qE "^${var}=" "$env_file" 2>/dev/null; then
+    if awk -v k="$var" 'index($0, k "=") == 1 {found=1; exit} END{exit !found}' "$env_file" 2>/dev/null; then
         local _tmp
         _tmp="$(mktemp)" && chmod 600 "$_tmp" \
-            && awk -v k="$var" -v v="$val" \
-                'BEGIN{pat="^" k "="} $0 ~ pat { print k "=" v; next } { print }' \
+            && _BACKUP_AWK_VAL="$val" awk -v k="$var" \
+                'BEGIN{pat="^" k "="} $0 ~ pat { print k "=" ENVIRON["_BACKUP_AWK_VAL"]; next } { print }' \
                 "$env_file" > "$_tmp" \
-            && mv "$_tmp" "$env_file" || { rm -f "$_tmp"; return 1; }
+            && unset _BACKUP_AWK_VAL && mv "$_tmp" "$env_file" || { unset _BACKUP_AWK_VAL; rm -f "$_tmp"; return 1; }
     else
         printf '%s=%s\n' "$var" "$val" >> "$env_file" || return 1
     fi
@@ -1648,7 +1660,7 @@ _backup_get_env() {
     local var="$1" default="${2:-}"
     local env_file="$PROJECT_DIR/.env"
     local val
-    val="$(grep -E "^${var}=" "$env_file" 2>/dev/null | tail -1 | cut -d= -f2-)" || true
+    val="$(awk -v k="$var" 'index($0, k "=") == 1 {val=substr($0, length(k)+2)} END{printf "%s", val}' "$env_file" 2>/dev/null)" || true
     if [ -n "$val" ]; then
         printf '%s' "$val"
     else
@@ -1789,13 +1801,21 @@ backup_dump() {
             dump_file="${tmp_dir}/new-api_${timestamp}.sql.gz"
             info "备份 MySQL..."
             # GORM DSN 格式: user:pass@tcp(host:port)/dbname?opts
-            # 注意：密码中含 @ 字符时解析会出错（W2），请确保密码不含 @
-            local db_user db_pass db_host db_port db_name
-            db_user="$(printf '%s' "$sql_dsn" | sed 's/:.*//')"
-            db_pass="$(printf '%s' "$sql_dsn" | sed 's/[^:]*://;s/@tcp(.*//')"
-            db_host="$(printf '%s' "$sql_dsn" | sed 's/.*@tcp(//;s/:.*//')"
-            db_port="$(printf '%s' "$sql_dsn" | sed 's/.*@tcp([^:]*://;s/)\/[^?]*.*//')"
-            db_name="$(printf '%s' "$sql_dsn" | sed 's/.*\///;s/?.*//')"
+            # 以 @tcp( 为凭据与主机的分隔点，支持密码中含 @ 或 : 的情况
+            local db_user db_pass db_host db_port db_name _creds _host_port
+            _creds="$(     printf '%s' "$sql_dsn" | sed 's/@tcp(.*//')"
+            db_user="$(    printf '%s' "$_creds"   | cut -d: -f1)"
+            db_pass="$(    printf '%s' "$_creds"   | cut -d: -f2-)"
+            _host_port="$( printf '%s' "$sql_dsn" | sed 's/.*@tcp(//;s/).*//')"
+            # 用最后一个冒号分隔 host 与 port，兼容 IPv6 地址（如 [::1]:3306）
+            if printf '%s' "$_host_port" | grep -qE ':[0-9]+$'; then
+                db_host="$(printf '%s' "$_host_port" | sed 's/:[0-9]*$//')"
+                db_port="$(printf '%s' "$_host_port" | sed 's/.*://')"
+            else
+                db_host="$_host_port"
+                db_port=""
+            fi
+            db_name="$(    printf '%s' "$sql_dsn" | sed 's/.*@tcp([^)]*)\///;s/?.*//')"
             ( set -o pipefail
               MYSQL_PWD="$db_pass" mysqldump \
                   -u "$db_user" -h "$db_host" -P "${db_port:-3306}" "$db_name" \
@@ -1836,12 +1856,24 @@ backup_dump() {
     _BACKUP_DUMP_TMP_DIR="$tmp_dir"
 }
 
+# aws s3 封装：通过环境变量传递 R2 凭据，避免凭据出现在 ps aux 进程列表中
+# --endpoint-url 为非敏感配置，直接作为 CLI flag 传入
+# 用法: _aws_r2 <access_key> <secret_key> <endpoint> <aws s3 子命令及参数...>
+_aws_r2() {
+    local _ak="$1" _sk="$2" _ep="$3"
+    shift 3
+    AWS_ACCESS_KEY_ID="$_ak" \
+    AWS_SECRET_ACCESS_KEY="$_sk" \
+    AWS_DEFAULT_REGION=auto \
+    aws s3 --endpoint-url "$_ep" "$@"
+}
+
 # 上传 dump 文件到 R2，并清理旧备份（只保留最近 N 个）
 backup_upload() {
     local dump_file="$1"
 
-    if ! command -v rclone >/dev/null 2>&1; then
-        error "未找到 rclone，请先安装: https://rclone.org/install/"
+    if ! command -v aws >/dev/null 2>&1; then
+        error "未找到 aws cli，请先安装: https://aws.amazon.com/cli/"
         return 1
     fi
 
@@ -1862,31 +1894,22 @@ backup_upload() {
     local r2_path="${bucket}/${backup_dir}"
 
     info "上传到 R2: ${r2_path}/$(basename "$dump_file")"
-    rclone copy \
-        --s3-provider=Cloudflare \
-        --s3-access-key-id="$access_key" \
-        --s3-secret-access-key="$secret_key" \
-        --s3-endpoint="$endpoint" \
-        --s3-env-auth=false \
-        "$dump_file" \
-        ":s3:${r2_path}/" || { error "上传失败，请检查 R2 配置和网络连接"; return 1; }
+    _aws_r2 "$access_key" "$secret_key" "$endpoint" \
+        cp "$dump_file" "s3://${r2_path}/$(basename "$dump_file")" \
+        || { error "上传失败，请检查 R2 配置和网络连接"; return 1; }
     info "上传成功"
 
     # 列出远端文件（按文件名排序），清理超出保留数量的旧备份
     info "检查旧备份（最多保留 ${keep} 个）..."
-    # 先捕获 rclone 退出码再排序，避免管道吞掉错误（同 backup_list 的修复）
+    # 先捕获 aws 退出码再提取文件名，避免管道吞掉错误（同 backup_list 的修复）
+    # aws s3 ls 输出格式：date time size filename，取最后一列得到文件名
     local file_list_raw file_list=""
-    if ! file_list_raw="$(rclone lsf \
-            --s3-provider=Cloudflare \
-            --s3-access-key-id="$access_key" \
-            --s3-secret-access-key="$secret_key" \
-            --s3-endpoint="$endpoint" \
-            --s3-env-auth=false \
-            ":s3:${r2_path}/" 2>/dev/null)"; then
+    if ! file_list_raw="$(_aws_r2 "$access_key" "$secret_key" "$endpoint" \
+            ls "s3://${r2_path}/" 2>/dev/null)"; then
         warn "列出远端文件失败，跳过旧备份清理"
         return 0
     fi
-    [ -n "$file_list_raw" ] && file_list="$(printf '%s\n' "$file_list_raw" | sort)"
+    [ -n "$file_list_raw" ] && file_list="$(printf '%s\n' "$file_list_raw" | awk '{print $NF}' | sort)"
 
     local total=0
     if [ -n "$file_list" ]; then
@@ -1899,13 +1922,8 @@ backup_upload() {
         old_files="$(printf '%s\n' "$file_list" | head -n "$to_delete")"
         while IFS= read -r f; do
             [ -z "$f" ] && continue
-            rclone delete \
-                --s3-provider=Cloudflare \
-                --s3-access-key-id="$access_key" \
-                --s3-secret-access-key="$secret_key" \
-                --s3-endpoint="$endpoint" \
-                --s3-env-auth=false \
-                ":s3:${r2_path}/${f}" 2>/dev/null \
+            _aws_r2 "$access_key" "$secret_key" "$endpoint" \
+                rm "s3://${r2_path}/${f}" 2>/dev/null \
                 && { info "已删除旧备份: $f"; deleted=$(( deleted + 1 )); } \
                 || warn "删除失败: $f"
         done <<EOF
@@ -1921,8 +1939,8 @@ EOF
 backup_list() {
     backup_check_config || return 1
 
-    if ! command -v rclone >/dev/null 2>&1; then
-        error "未找到 rclone，请先安装: https://rclone.org/install/"
+    if ! command -v aws >/dev/null 2>&1; then
+        error "未找到 aws cli，请先安装: https://aws.amazon.com/cli/"
         return 1
     fi
 
@@ -1936,17 +1954,12 @@ backup_list() {
     local endpoint="https://${account_id}.r2.cloudflarestorage.com"
 
     title "R2 备份列表（${bucket}/${backup_dir}）"
-    # 先捕获 rclone 退出码，再交给 sort，避免管道吞掉 rclone 错误（B3）
+    # 先捕获 aws 退出码，再交给 sort，避免管道吞掉错误
+    # aws s3 ls 输出格式：date time size filename，sort -k4 按文件名排序
     local list_output
-    list_output="$(rclone lsl \
-        --s3-provider=Cloudflare \
-        --s3-access-key-id="$access_key" \
-        --s3-secret-access-key="$secret_key" \
-        --s3-endpoint="$endpoint" \
-        --s3-env-auth=false \
-        ":s3:${bucket}/${backup_dir}/" 2>&1)" \
+    list_output="$(_aws_r2 "$access_key" "$secret_key" "$endpoint" \
+        ls "s3://${bucket}/${backup_dir}/" 2>&1)" \
         || { error "列出备份失败，请检查 R2 配置"; return 1; }
-    # sort -k4 按第4列（文件名）排序，避免按文件大小排序
     printf '%s\n' "$list_output" | sort -k4
 }
 
@@ -1960,7 +1973,7 @@ backup_cron() {
 
     local script_path="$PROJECT_DIR/scripts/setup.sh"
     local cron_marker="setup.sh backup"
-    local cron_line="0 19 * * * cd \"$PROJECT_DIR\" && \"$script_path\" backup >> /tmp/new-api-backup.log 2>&1"
+    local cron_line="0 19 * * * cd \"$PROJECT_DIR\" && \"$script_path\" backup >> \"$PROJECT_DIR/backup.log\" 2>&1"
     local already_installed=false
 
     if crontab -l 2>/dev/null | grep -qF "$cron_marker"; then
@@ -2004,7 +2017,7 @@ backup_cron() {
         echo "将添加以下 cron 任务："
         echo "  $cron_line"
         echo "  执行时间：每天 19:00 UTC（北京时间 03:00）"
-        echo "  日志文件：/tmp/new-api-backup.log"
+        echo "  日志文件：$PROJECT_DIR/backup.log"
         echo ""
         echo "请选择操作："
         echo "  1) 安装定时任务"
