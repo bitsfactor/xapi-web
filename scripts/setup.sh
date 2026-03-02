@@ -432,6 +432,7 @@ build_frontend() {
     (
         cd "$PROJECT_DIR/web"
         info "安装前端依赖..."
+        bun pm trust @douyinfe/semi-ui @douyinfe/semi-icons @douyinfe/vite-plugin-semi
         bun install
         info "编译前端 (版本: ${version})..."
         DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION="${version}" bun run build
